@@ -652,6 +652,12 @@ class AscendQKVParallelLinear310(QKVParallelLinear):
             disable_tp=disable_tp,
         )
 
+    def _kv_shard_rank(self) -> int:
+        replicas = int(getattr(self, "num_kv_head_replicas", 1))
+        if replicas <= 1:
+            return int(self.tp_rank)
+        return int(self.tp_rank) // replicas
+
     def _scatter_per_head(self, *, dst: torch.Tensor, dst_off: int, heads: int,
                           head_real: int, head_pad: int, src: torch.Tensor, in_real: int) -> None:
         part = dst.narrow(0, dst_off, heads * head_pad).view(heads, head_pad, -1)
