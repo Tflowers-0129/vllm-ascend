@@ -743,6 +743,7 @@ class AscendQKVParallelLinear310(QKVParallelLinear):
             raise RuntimeError("loaded_shard_id must be q/k/v")
 
     def forward(self, input_: torch.Tensor):
+        _patch_attn_meta_from_qkv(self)
         bias = None if self.skip_bias_add else self.bias
         out = self.quant_method.apply(self, input_, bias)
         out_bias = self.bias if self.skip_bias_add else None
