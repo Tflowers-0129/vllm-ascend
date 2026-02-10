@@ -109,6 +109,8 @@ class NPUWorker(WorkerBase):
         register_ascend_customop(vllm_config)
         # init ascend config and soc version
         init_ascend_config(vllm_config)
+        # Initialize SP cache eagerly to avoid no-context calls during profile.
+        enable_sp(vllm_config)
         check_ascend_device_type()
 
         super().__init__(

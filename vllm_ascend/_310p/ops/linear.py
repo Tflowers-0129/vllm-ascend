@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import gc
-import math
-import os
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional
 
 import torch
 import torch.nn as nn
@@ -32,8 +29,6 @@ from vllm.model_executor.utils import set_weight_attrs
 _ALIGN = 16
 _NZ_FORMAT = 29
 
-_QKV_PAD_REGISTRY: Dict[str, Dict[str, int]] = {}
-
 
 # ----------------------------
 # Minimal helpers
@@ -41,118 +36,6 @@ _QKV_PAD_REGISTRY: Dict[str, Dict[str, int]] = {}
 
 def _align_up(x: int, a: int = _ALIGN) -> int:
     return ((x + a - 1) // a) * a if a > 0 else x
-
-
-def _strip_suffix(prefix: str, suffixes: Tuple[str, ...]) -> Optional[str]:
-    for s in suffixes:
-        if prefix.endswith(s):
-            return prefix[: -len(s)]
-    return None
-
-
-def _qkv_base_prefix(prefix: str) -> Optional[str]:
-    return _strip_suffix(prefix, (".qkv", ".qkv_proj", ".q_proj"))
-
-
-def _proj_base_prefix(prefix: str) -> Optional[str]:
-    return _strip_suffix(prefix, (".proj", ".o_proj", ".out_proj", ".output_proj"))
-
-
-def _register_qkv_pad_meta(prefix: str, *, num_heads: int, head_size: int, head_size_pad: int) -> None:
-    base = _qkv_base_prefix(prefix)
-    if base is None:
-        return
-    if head_size_pad <= head_size:
-        return
-    _QKV_PAD_REGISTRY[base] = {
-        "proj_in_pad": int(num_heads * head_size_pad),
-        "head_size": int(head_size),
-        "head_size_pad": int(head_size_pad),
-    }
-
-
-def _get_force_in_pad_for_proj(prefix: str) -> Optional[int]:
-    base = _proj_base_prefix(prefix)
-    if base is None:
-        return None
-    meta = _QKV_PAD_REGISTRY.get(base)
-    if meta is None:
-        return None
-    return int(meta["proj_in_pad"])
-
-
-def _patch_attn_meta_from_qkv(layer: "AscendQKVParallelLinear310") -> None:
-    if getattr(layer, "_pad_meta_patched", False):
-        return
-    head_size = int(getattr(layer, "_head_size", 0))
-    head_size_pad = int(getattr(layer, "_head_size_pad", head_size))
-    if head_size_pad <= head_size:
-        layer._pad_meta_patched = True
-        return
-
-    def _patch_module(m: nn.Module) -> None:
-        if not hasattr(m, "head_size_orig"):
-            setattr(m, "head_size_orig", head_size)
-        if hasattr(m, "head_size"):
-            m.head_size = head_size_pad
-        if hasattr(m, "head_dim"):
-            m.head_dim = head_size_pad
-        if hasattr(m, "hidden_size_per_attention_head"):
-            m.hidden_size_per_attention_head = head_size_pad
-        if hasattr(m, "projection_size"):
-            if hasattr(m, "num_attention_heads_per_partition"):
-                m.projection_size = int(m.num_attention_heads_per_partition) * head_size_pad
-            elif hasattr(m, "num_heads"):
-                m.projection_size = int(m.num_heads) * head_size_pad
-        if hasattr(m, "scale"):
-            m.scale = 1.0 / math.sqrt(head_size)
-
-        for attr in ("rotary_emb", "rotary_pos_emb", "rotary_embedding", "apply_rotary_emb"):
-            rope = getattr(m, attr, None)
-            if rope is None:
-                continue
-            if not hasattr(rope, "head_size_orig"):
-                setattr(rope, "head_size_orig", head_size)
-            if hasattr(rope, "head_size"):
-                rope.head_size = head_size_pad
-
-    def _iter_owner_modules(obj: object):
-        seen = set()
-        for ref in gc.get_referrers(obj):
-            if isinstance(ref, nn.Module):
-                rid = id(ref)
-                if rid not in seen:
-                    seen.add(rid)
-                    yield ref
-                continue
-            if not isinstance(ref, dict):
-                continue
-            for owner in gc.get_referrers(ref):
-                if not isinstance(owner, nn.Module):
-                    continue
-                if getattr(owner, "__dict__", None) is not ref:
-                    continue
-                oid = id(owner)
-                if oid in seen:
-                    continue
-                seen.add(oid)
-                yield owner
-
-    patched_any = False
-    for ref in _iter_owner_modules(layer):
-        if not any(v is layer for v in ref.__dict__.values()):
-            continue
-        _patch_module(ref)
-        patched_any = True
-        inner = getattr(ref, "attn", None)
-        if isinstance(inner, nn.Module):
-            _patch_module(inner)
-        inner = getattr(ref, "self_attn", None)
-        if isinstance(inner, nn.Module):
-            _patch_module(inner)
-
-    # Keep trying until the owner modules are reachable from gc referrers.
-    layer._pad_meta_patched = patched_any
 
 
 def _pad_last_dim(x: torch.Tensor, new_k: int) -> torch.Tensor:
@@ -257,9 +140,6 @@ class AscendUnquantizedLinearMethod310(UnquantizedLinearMethod):
 
         in_real = int(input_size_per_partition)
         in_pad = _align_up(in_real) if getattr(layer, "_pad_in", False) else in_real
-        force_in_pad = getattr(layer, "_force_in_pad", None)
-        if force_in_pad is not None:
-            in_pad = max(in_pad, int(force_in_pad))
 
         # ---- QKV special allocation ----
         if getattr(layer, "_qkv_per_head_pad", False):
@@ -379,7 +259,8 @@ class AscendColumnParallelLinear310(ColumnParallelLinear):
             self.output_partition_sizes = [divide(int(s), int(self.tp_size)) for s in self.output_sizes]
 
         self._pad_in = False
-        self._pad_out = True
+        if not hasattr(self, "_pad_out"):
+            self._pad_out = False
         if not hasattr(self, "_keep_out_pad"):
             self._keep_out_pad = False
 
@@ -432,7 +313,6 @@ class AscendColumnParallelLinear310(ColumnParallelLinear):
         _copy_2d(param.data, w, out_off=0, out_real=out_real, in_real=in_real)
 
     def forward(self, input_: torch.Tensor):
-        _patch_attn_meta_from_qkv(self)
         bias = None if self.skip_bias_add else self.bias
         out = self.quant_method.apply(self, input_, bias)
         out_bias = self.bias if self.skip_bias_add else None
@@ -464,8 +344,7 @@ class AscendRowParallelLinear310(RowParallelLinear):
         self.output_size_per_partition = int(output_size)
         self.output_partition_sizes = [int(output_size)]
 
-        self._force_in_pad = _get_force_in_pad_for_proj(prefix)
-        self._pad_in = True
+        self._pad_in = "down_proj" in prefix
         self._pad_out = False
 
         AscendLinearBase310.__init__(self, input_size, output_size,
@@ -546,7 +425,8 @@ class AscendMergedColumnParallelLinear310(MergedColumnParallelLinear):
     def __init__(self, input_size: int, output_sizes: List[int], **kwargs):
         self.output_sizes = list(map(int, output_sizes))
         self._force_part_align = [_ALIGN] * len(self.output_sizes)
-        self._keep_out_pad = os.environ.get("VLLM_ASCEND_KEEP_QKV_PAD", "1") != "0"
+        self._keep_out_pad = True
+        self._pad_out = True
         AscendColumnParallelLinear310.__init__(
             self,
             input_size=input_size,
@@ -632,15 +512,15 @@ class AscendQKVParallelLinear310(QKVParallelLinear):
 
         # per-head output padding (QKV)
         self._pad_in = False
-        self._pad_out = True
-        self._keep_out_pad = True
+        self._pad_out = False
+        self._keep_out_pad = False
         self._qkv_per_head_pad = True
         self._q_heads = self.num_heads
         self._kv_heads = self.num_kv_heads
         self._head_size = self.head_size
         self._v_head_size = self.v_head_size
-        self._head_size_pad = _align_up(self.head_size)
-        self._v_head_size_pad = _align_up(self.v_head_size)
+        self._head_size_pad = int(self.head_size)
+        self._v_head_size_pad = int(self.v_head_size)
         self._qkv_parts_real = [
             self.num_heads * self.head_size,
             self.num_kv_heads * self.head_size,
@@ -651,13 +531,6 @@ class AscendQKVParallelLinear310(QKVParallelLinear):
             self.num_kv_heads * self._head_size_pad,
             self.num_kv_heads * self._v_head_size_pad,
         ]
-        _register_qkv_pad_meta(
-            prefix,
-            num_heads=self.num_heads,
-            head_size=self.head_size,
-            head_size_pad=self._head_size_pad,
-        )
-        self._pad_meta_patched = False
 
         AscendColumnParallelLinear310.__init__(
             self,
@@ -764,7 +637,6 @@ class AscendQKVParallelLinear310(QKVParallelLinear):
             raise RuntimeError("loaded_shard_id must be q/k/v")
 
     def forward(self, input_: torch.Tensor):
-        _patch_attn_meta_from_qkv(self)
         bias = None if self.skip_bias_add else self.bias
         out = self.quant_method.apply(self, input_, bias)
         out_bias = self.bias if self.skip_bias_add else None
