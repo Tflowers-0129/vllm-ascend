@@ -8,7 +8,11 @@ import torch.nn as nn
 import torch_npu
 from torch.nn.parameter import Parameter, UninitializedParameter
 
-from vllm.distributed import divide
+from vllm.distributed import (
+    divide,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     LinearBase,
@@ -21,7 +25,6 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.utils import set_weight_attrs
-from vllm_ascend.ops.linear_op import get_parallel_op, get_replicated_op
 
 
 _ALIGN = 16
@@ -88,11 +91,26 @@ def _load_1d_or_scalar_param(
         p.copy_(w)
         return True
 
+    # allow loading smaller 1D params into padded storage
+    if w.numel() < p.numel():
+        p.zero_()
+        p[: w.numel()].copy_(w)
+        return True
+
     # sometimes bias stored full -> slice per TP
     if tp_rank is not None and tp_size is not None and w.numel() == p.numel() * int(tp_size):
         start = int(tp_rank) * p.numel()
         p.copy_(w.narrow(0, start, p.numel()))
         return True
+
+    # global real -> local padded (slice then pad)
+    if tp_rank is not None and tp_size is not None and w.numel() % int(tp_size) == 0:
+        local = w.numel() // int(tp_size)
+        if local <= p.numel():
+            start = int(tp_rank) * int(local)
+            p.zero_()
+            p[:local].copy_(w.narrow(0, start, int(local)))
+            return True
 
     raise RuntimeError(f"1D param mismatch: param={tuple(p.shape)} loaded={tuple(w.shape)}")
 
@@ -229,7 +247,9 @@ class AscendColumnParallelLinear310(ColumnParallelLinear):
                  skip_bias_add: bool = False, params_dtype: Optional[torch.dtype] = None,
                  quant_config: Optional[QuantizationConfig] = None, prefix: str = "",
                  *, return_bias: bool = True, disable_tp: bool = False):
-        self.custom_op, self.tp_rank, self.tp_size = get_parallel_op(disable_tp, prefix, self, "column")
+        self.custom_op = None
+        self.tp_rank = 0 if disable_tp else get_tensor_model_parallel_rank()
+        self.tp_size = 1 if disable_tp else get_tensor_model_parallel_world_size()
 
         self.input_size_per_partition = int(input_size)
         self.output_size_per_partition = divide(int(output_size), int(self.tp_size))
@@ -241,6 +261,8 @@ class AscendColumnParallelLinear310(ColumnParallelLinear):
 
         self._pad_in = False
         self._pad_out = True
+        if not hasattr(self, "_keep_out_pad"):
+            self._keep_out_pad = False
 
         AscendLinearBase310.__init__(self, input_size, output_size,
                                      skip_bias_add=skip_bias_add, params_dtype=params_dtype,
@@ -259,13 +281,14 @@ class AscendColumnParallelLinear310(ColumnParallelLinear):
         )
 
         if bias:
-            self.bias = Parameter(torch.empty(int(self.output_size_per_partition), dtype=self.params_dtype))
-            set_weight_attrs(self.bias, {"output_dim": 0, "weight_loader": self.weight_loader})
+            out_pad = int(getattr(self.weight, "out_pad", self.output_size_per_partition))
+            self.bias = Parameter(torch.empty(out_pad, dtype=self.params_dtype))
+            set_weight_attrs(self.bias, {
+                "output_dim": 0,
+                "weight_loader": self.weight_loader,
+            })
         else:
             self.register_parameter("bias", None)
-
-        if self.custom_op is not None:
-            self.custom_op.update_attrs()
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor, *_, **__):
         if _load_1d_or_scalar_param(param=param, loaded_weight=loaded_weight,
@@ -290,20 +313,19 @@ class AscendColumnParallelLinear310(ColumnParallelLinear):
         _copy_2d(param.data, w, out_off=0, out_real=out_real, in_real=in_real)
 
     def forward(self, input_: torch.Tensor):
-        if self.custom_op is not None:
-            return self.custom_op.apply(input_)
-
         bias = None if self.skip_bias_add else self.bias
         out = self.quant_method.apply(self, input_, bias)
+        out_bias = self.bias if self.skip_bias_add else None
 
-        # Keep vLLM semantics: return REAL features only
         out_real = int(getattr(self.weight, "out_real", out.shape[-1]))
-        if out.shape[-1] != out_real:
+        if (not getattr(self, "_keep_out_pad", False)) and out.shape[-1] != out_real:
             out = out[..., :out_real].contiguous()
+            if out_bias is not None and out_bias.numel() != out_real:
+                out_bias = out_bias[:out_real].contiguous()
 
         if not self.return_bias:
             return out
-        return out, (self.bias if self.skip_bias_add else None)
+        return out, out_bias
 
 
 # ----------------------------
@@ -315,7 +337,9 @@ class AscendRowParallelLinear310(RowParallelLinear):
                  skip_bias_add: bool = False, params_dtype: Optional[torch.dtype] = None, reduce_results: bool = True,
                  quant_config: Optional[QuantizationConfig] = None, prefix: str = "",
                  *, return_bias: bool = True, disable_tp: bool = False):
-        self.custom_op, self.tp_rank, self.tp_size = get_parallel_op(disable_tp, prefix, self, "row")
+        self.custom_op = None
+        self.tp_rank = 0 if disable_tp else get_tensor_model_parallel_rank()
+        self.tp_size = 1 if disable_tp else get_tensor_model_parallel_world_size()
 
         self.input_size_per_partition = divide(int(input_size), int(self.tp_size))
         self.output_size_per_partition = int(output_size)
@@ -342,14 +366,17 @@ class AscendRowParallelLinear310(RowParallelLinear):
             weight_loader=self.weight_loader,
         )
 
+        in_real = int(getattr(self.weight, "in_real", self.input_size_per_partition))
+        in_pad = int(getattr(self.weight, "in_pad", in_real))
+        if in_pad > in_real:
+            # keep comm shapes aligned with padded K
+            self.input_size_per_partition = in_pad
+
         if bias:
             self.bias = Parameter(torch.empty(int(self.output_size), dtype=self.params_dtype))
             set_weight_attrs(self.bias, {"output_dim": 0, "weight_loader": self.weight_loader})
         else:
             self.register_parameter("bias", None)
-
-        if self.custom_op is not None:
-            self.custom_op.update_attrs()
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor, *_, **__):
         if _load_1d_or_scalar_param(param=param, loaded_weight=loaded_weight):
@@ -370,9 +397,6 @@ class AscendRowParallelLinear310(RowParallelLinear):
         _copy_2d(param.data, w, out_off=0, out_real=out_real, in_real=in_real)
 
     def forward(self, input_: torch.Tensor, **_):
-        if self.custom_op is not None:
-            return self.custom_op.apply(input_)
-
         x = input_
         if not self.input_is_parallel:
             x = torch.chunk(x, int(self.tp_size), dim=-1)[int(self.tp_rank)].contiguous()
@@ -402,7 +426,13 @@ class AscendMergedColumnParallelLinear310(MergedColumnParallelLinear):
     def __init__(self, input_size: int, output_sizes: List[int], **kwargs):
         self.output_sizes = list(map(int, output_sizes))
         self._force_part_align = [_ALIGN] * len(self.output_sizes)
-        super().__init__(input_size=input_size, output_size=sum(self.output_sizes), **kwargs)
+        self._keep_out_pad = os.environ.get("VLLM_ASCEND_KEEP_QKV_PAD", "1") != "0"
+        AscendColumnParallelLinear310.__init__(
+            self,
+            input_size=input_size,
+            output_size=sum(self.output_sizes),
+            **kwargs,
+        )
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor, loaded_shard_id: Optional[int] = None, *_, **__):
         if _load_1d_or_scalar_param(param=param, loaded_weight=loaded_weight,
@@ -444,8 +474,77 @@ class AscendMergedColumnParallelLinear310(MergedColumnParallelLinear):
 
 class AscendQKVParallelLinear310(QKVParallelLinear):
     def __init__(self, hidden_size: int, head_size: int, total_num_heads: int,
-                 total_num_kv_heads: Optional[int] = None, **kwargs):
-        super().__init__(hidden_size, head_size, total_num_heads, total_num_kv_heads, **kwargs)
+                 total_num_kv_heads: Optional[int] = None, bias: bool = True,
+                 skip_bias_add: bool = False, params_dtype: Optional[torch.dtype] = None,
+                 quant_config: Optional[QuantizationConfig] = None, prefix: str = "",
+                 *, return_bias: bool = True, disable_tp: bool = False,
+                 v_head_size: Optional[int] = None):
+        # mimic vllm QKV init but route to 310P column impl
+        self.v_head_size = v_head_size if v_head_size is not None else head_size
+        tp_size = 1 if disable_tp else get_tensor_model_parallel_world_size()
+
+        self.hidden_size = hidden_size
+        self.head_size = head_size
+        self.total_num_heads = total_num_heads
+        if total_num_kv_heads is None:
+            total_num_kv_heads = total_num_heads
+        self.total_num_kv_heads = total_num_kv_heads
+
+        self.num_heads = divide(self.total_num_heads, tp_size)
+        if tp_size >= self.total_num_kv_heads:
+            self.num_kv_heads = 1
+            self.num_kv_head_replicas = divide(tp_size, self.total_num_kv_heads)
+        else:
+            self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
+            self.num_kv_head_replicas = 1
+
+        input_size = self.hidden_size
+        output_size = (
+            self.num_heads * self.head_size
+            + self.num_kv_heads * self.head_size
+            + self.num_kv_heads * self.v_head_size
+        ) * tp_size
+        self.output_sizes = [
+            self.num_heads * self.head_size * tp_size,
+            self.num_kv_heads * self.head_size * tp_size,
+            self.num_kv_heads * self.v_head_size * tp_size,
+        ]
+
+        # per-head output padding (QKV)
+        self._pad_in = False
+        self._pad_out = True
+        self._keep_out_pad = True
+        self._qkv_per_head_pad = True
+        self._q_heads = self.num_heads
+        self._kv_heads = self.num_kv_heads
+        self._head_size = self.head_size
+        self._v_head_size = self.v_head_size
+        self._head_size_pad = _align_up(self.head_size)
+        self._v_head_size_pad = _align_up(self.v_head_size)
+        self._qkv_parts_real = [
+            self.num_heads * self.head_size,
+            self.num_kv_heads * self.head_size,
+            self.num_kv_heads * self.v_head_size,
+        ]
+        self._qkv_parts_pad = [
+            self.num_heads * self._head_size_pad,
+            self.num_kv_heads * self._head_size_pad,
+            self.num_kv_heads * self._v_head_size_pad,
+        ]
+
+        AscendColumnParallelLinear310.__init__(
+            self,
+            input_size=input_size,
+            output_size=output_size,
+            bias=bias,
+            gather_output=False,
+            skip_bias_add=skip_bias_add,
+            params_dtype=params_dtype,
+            quant_config=quant_config,
+            prefix=prefix,
+            return_bias=return_bias,
+            disable_tp=disable_tp,
+        )
 
     def _scatter_per_head(self, *, dst: torch.Tensor, dst_off: int, heads: int,
                           head_real: int, head_pad: int, src: torch.Tensor, in_real: int) -> None:
@@ -532,20 +631,19 @@ class AscendQKVParallelLinear310(QKVParallelLinear):
             raise RuntimeError("loaded_shard_id must be q/k/v")
 
     def forward(self, input_: torch.Tensor):
-        if self.custom_op is not None:
-            return self.custom_op.apply(input_)
-
         bias = None if self.skip_bias_add else self.bias
         out = self.quant_method.apply(self, input_, bias)
+        out_bias = self.bias if self.skip_bias_add else None
 
-        # always return REAL features
-        out_real = int(getattr(self.weight, "out_real"))
-        if out.shape[-1] != out_real:
+        out_real = int(getattr(self.weight, "out_real", out.shape[-1]))
+        if (not getattr(self, "_keep_out_pad", False)) and out.shape[-1] != out_real:
             out = out[..., :out_real].contiguous()
+            if out_bias is not None and out_bias.numel() != out_real:
+                out_bias = out_bias[:out_real].contiguous()
 
         if not self.return_bias:
             return out
-        return out, (self.bias if self.skip_bias_add else None)
+        return out, out_bias
 
 
 # ----------------------------
@@ -554,7 +652,7 @@ class AscendQKVParallelLinear310(QKVParallelLinear):
 
 class AscendReplicatedLinear310(ReplicatedLinear):
     def __init__(self, input_size: int, output_size: int, **kwargs):
-        self.custom_op = get_replicated_op(kwargs.get("disable_tp", False), kwargs.get("prefix", ""), self)
+        self.custom_op = None
 
         self.output_partition_sizes = [int(output_size)]
         self._pad_in = False
@@ -578,9 +676,6 @@ class AscendReplicatedLinear310(ReplicatedLinear):
         else:
             self.register_parameter("bias", None)
 
-        if self.custom_op is not None:
-            self.custom_op.update_attrs()
-
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor, *_, **__):
         if _load_1d_or_scalar_param(param=param, loaded_weight=loaded_weight):
             return
@@ -591,9 +686,6 @@ class AscendReplicatedLinear310(ReplicatedLinear):
         _copy_2d(param.data, loaded_weight, out_off=0, out_real=out_real, in_real=in_real)
 
     def forward(self, input_: torch.Tensor):
-        if self.custom_op is not None:
-            return self.custom_op.apply(input_)
-
         in_real = int(getattr(self.weight, "in_real", input_.shape[-1]))
         in_pad  = int(getattr(self.weight, "in_pad", in_real))
         x = _pad_last_dim(input_, in_pad) if (in_pad > in_real and input_.shape[-1] == in_real) else input_
