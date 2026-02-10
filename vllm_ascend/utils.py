@@ -629,7 +629,15 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
         from vllm_ascend._310p.ops.activation import AscendSiluAndMul310
         from vllm_ascend._310p.ops.layernorm import AscendGemmaRMSNorm310, AscendRMSNorm310
         from vllm_ascend._310p.ops.mm_encoder_attention import AscendMMEncoderAttention310
-        from vllm_ascend._310p.ops.rotary_embedding import AscendRotaryEmbedding310
+        from vllm_ascend._310p.ops.rotary_embedding import AscendRotaryEmbedding310, AscendMRotaryEmbedding310
+        from vllm_ascend._310p.ops.linear import (
+            AscendColumnParallelLinear310,
+            AscendRowParallelLinear310,
+            AscendMergedColumnParallelLinear310,
+            AscendQKVParallelLinear310,
+            AscendReplicatedLinear310,
+        )
+
 
         REGISTERED_ASCEND_OPS.update(
             {
@@ -640,8 +648,15 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
                 "GemmaRMSNorm": AscendGemmaRMSNorm310,
                 "FusedMoE": AscendFusedMoE310,
                 "SharedFusedMoE": AscendSharedFusedMoE310,
+                "MRotaryEmbedding": AscendMRotaryEmbedding310,
+                "ColumnParallelLinear": AscendColumnParallelLinear310,
+                "RowParallelLinear": AscendRowParallelLinear310,
+                "MergedColumnParallelLinear": AscendMergedColumnParallelLinear310,
+                "QKVParallelLinear": AscendQKVParallelLinear310,
+                "ReplicatedLinear": AscendReplicatedLinear310,
             }
         )
+
 
     for name, op_cls in REGISTERED_ASCEND_OPS.items():
         CustomOp.register_oot(_decorated_op_cls=op_cls, name=name)
