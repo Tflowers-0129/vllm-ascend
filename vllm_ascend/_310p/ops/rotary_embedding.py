@@ -138,14 +138,27 @@ def _apply_rotary_forward_oot_310(
     x, cos, sin, origin_shape, origin_dtype = self._pre_process(x, cos, sin)
 
     head_dim = x.shape[-1]
-    cos, sin = _pad_cos_sin_for_head_dim(cos, sin, head_dim)
+    head_dim_real = getattr(self, "head_size_orig", head_dim)
+    head_dim_real = int(head_dim_real) if head_dim_real is not None else head_dim
+    head_dim_real = min(head_dim_real, head_dim)
 
-    cos = torch.cat((cos, cos), dim=-1)
-    sin = torch.cat((sin, sin), dim=-1)
-    cos = cos.reshape(1, -1, 1, head_dim)
-    sin = sin.reshape(1, -1, 1, head_dim)
+    if head_dim_real < head_dim:
+        x_rot = x[..., :head_dim_real]
+        x_pass = x[..., head_dim_real:]
+    else:
+        x_rot = x
+        x_pass = None
 
-    output = torch_npu.npu_rotary_mul(x, cos, sin)
+    cos_r, sin_r = _pad_cos_sin_for_head_dim(cos, sin, head_dim_real)
+
+    cos_r = torch.cat((cos_r, cos_r), dim=-1)
+    sin_r = torch.cat((sin_r, sin_r), dim=-1)
+    cos_r = cos_r.reshape(1, -1, 1, head_dim_real)
+    sin_r = sin_r.reshape(1, -1, 1, head_dim_real)
+
+    out_rot = torch_npu.npu_rotary_mul(x_rot, cos_r, sin_r)
+
+    output = out_rot if x_pass is None else torch.cat((out_rot, x_pass), dim=-1)
     output = self._post_process(output, origin_shape, origin_dtype)
     return output
 

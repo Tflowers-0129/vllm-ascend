@@ -415,11 +415,30 @@ class AscendColumnParallelLinear310(ColumnParallelLinear):
         out = self.quant_method.apply(self, input_, bias)
         out_bias = self.bias if self.skip_bias_add else None
 
-        out_real = int(getattr(self.weight, "out_real", out.shape[-1]))
-        if (not getattr(self, "_keep_out_pad", False)) and out.shape[-1] != out_real:
-            out = out[..., :out_real].contiguous()
-            if out_bias is not None and out_bias.numel() != out_real:
-                out_bias = out_bias[:out_real].contiguous()
+        # 若 per-head pad 导致输出维度大于实际 head_size，这里裁掉 padding，避免下游 reshape 形状不匹配
+        q_pad, k_pad, v_pad = self._qkv_parts_pad
+        q_real, k_real, v_real = self._qkv_parts_real
+        total_pad = q_pad + k_pad + v_pad
+        total_real = q_real + k_real + v_real
+
+        if (not getattr(self, "_keep_out_pad", False)) and out.shape[-1] != total_real:
+            if out.shape[-1] == total_pad:
+                q = out[..., 0:q_pad][..., :q_real]
+                k = out[..., q_pad:q_pad + k_pad][..., :k_real]
+                v = out[..., q_pad + k_pad:q_pad + k_pad + v_pad][..., :v_real]
+                out = torch.cat([q, k, v], dim=-1).contiguous()
+                if out_bias is not None and out_bias.numel() == total_pad:
+                    qb = out_bias[0:q_pad][:q_real]
+                    kb = out_bias[q_pad:q_pad + k_pad][:k_real]
+                    vb = out_bias[q_pad + k_pad:q_pad + k_pad + v_pad][:v_real]
+                    out_bias = torch.cat([qb, kb, vb], dim=-1).contiguous()
+            else:
+                # fallback: 保持原逻辑裁剪到 out_real（若 weight 上已有标记）
+                out_real = int(getattr(self.weight, "out_real", out.shape[-1]))
+                if out.shape[-1] != out_real:
+                    out = out[..., :out_real].contiguous()
+                    if out_bias is not None and out_bias.numel() != out_real:
+                        out_bias = out_bias[:out_real].contiguous()
 
         if not self.return_bias:
             return out
@@ -612,7 +631,8 @@ class AscendQKVParallelLinear310(QKVParallelLinear):
         # per-head output padding (QKV)
         self._pad_in = False
         self._pad_out = True
-        self._keep_out_pad = True
+        # 默认保留 QKV padding，如需裁剪可设置 VLLM_ASCEND_KEEP_QKV_PAD=0
+        self._keep_out_pad = os.environ.get("VLLM_ASCEND_KEEP_QKV_PAD", "1") != "0"
         self._qkv_per_head_pad = True
         self._q_heads = self.num_heads
         self._kv_heads = self.num_kv_heads
