@@ -17,6 +17,8 @@
 
 from vllm.triton_utils import HAS_TRITON
 
+from vllm_ascend.utils import is_310p
+
 if HAS_TRITON:
     import vllm_ascend.patch.worker.patch_triton
 
@@ -33,3 +35,6 @@ import vllm_ascend.patch.worker.patch_rejection_sampler  # noqa
 import vllm_ascend.patch.worker.patch_qwen3_next  # noqa
 import vllm_ascend.patch.worker.patch_v2_egale  # noqa
 import vllm_ascend.patch.worker.patch_huanyuan_vl  # noqa
+
+if is_310p():
+    import vllm_ascend._310p.patch_qwen2_5_vl  # noqa
