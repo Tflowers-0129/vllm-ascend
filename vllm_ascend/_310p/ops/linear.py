@@ -107,30 +107,52 @@ def _patch_attn_meta_from_qkv(layer: "AscendQKVParallelLinear310") -> None:
         if hasattr(m, "scale"):
             m.scale = 1.0 / math.sqrt(head_size)
 
-        for attr in ("rotary_emb", "rotary_pos_emb", "rotary_embedding"):
+        for attr in ("rotary_emb", "rotary_pos_emb", "rotary_embedding", "apply_rotary_emb"):
             rope = getattr(m, attr, None)
             if rope is None:
                 continue
+            if not hasattr(rope, "head_size_orig"):
+                setattr(rope, "head_size_orig", head_size)
             if hasattr(rope, "head_size"):
-                if not hasattr(rope, "head_size_orig"):
-                    setattr(rope, "head_size_orig", head_size)
                 rope.head_size = head_size_pad
 
-    for ref in gc.get_referrers(layer):
-        if not isinstance(ref, nn.Module):
-            continue
-        for v in ref.__dict__.values():
-            if v is layer:
-                _patch_module(ref)
-                inner = getattr(ref, "attn", None)
-                if isinstance(inner, nn.Module):
-                    _patch_module(inner)
-                inner = getattr(ref, "self_attn", None)
-                if isinstance(inner, nn.Module):
-                    _patch_module(inner)
-                break
+    def _iter_owner_modules(obj: object):
+        seen = set()
+        for ref in gc.get_referrers(obj):
+            if isinstance(ref, nn.Module):
+                rid = id(ref)
+                if rid not in seen:
+                    seen.add(rid)
+                    yield ref
+                continue
+            if not isinstance(ref, dict):
+                continue
+            for owner in gc.get_referrers(ref):
+                if not isinstance(owner, nn.Module):
+                    continue
+                if getattr(owner, "__dict__", None) is not ref:
+                    continue
+                oid = id(owner)
+                if oid in seen:
+                    continue
+                seen.add(oid)
+                yield owner
 
-    layer._pad_meta_patched = True
+    patched_any = False
+    for ref in _iter_owner_modules(layer):
+        if not any(v is layer for v in ref.__dict__.values()):
+            continue
+        _patch_module(ref)
+        patched_any = True
+        inner = getattr(ref, "attn", None)
+        if isinstance(inner, nn.Module):
+            _patch_module(inner)
+        inner = getattr(ref, "self_attn", None)
+        if isinstance(inner, nn.Module):
+            _patch_module(inner)
+
+    # Keep trying until the owner modules are reachable from gc referrers.
+    layer._pad_meta_patched = patched_any
 
 
 def _pad_last_dim(x: torch.Tensor, new_k: int) -> torch.Tensor:
@@ -415,35 +437,15 @@ class AscendColumnParallelLinear310(ColumnParallelLinear):
         out = self.quant_method.apply(self, input_, bias)
         out_bias = self.bias if self.skip_bias_add else None
 
-        # 若 per-head pad 导致输出维度大于实际 head_size，这里裁掉 padding，避免下游 reshape 形状不匹配
-        q_pad, k_pad, v_pad = self._qkv_parts_pad
-        q_real, k_real, v_real = self._qkv_parts_real
-        total_pad = q_pad + k_pad + v_pad
-        total_real = q_real + k_real + v_real
-
-        if (not getattr(self, "_keep_out_pad", False)) and out.shape[-1] != total_real:
-            if out.shape[-1] == total_pad:
-                q = out[..., 0:q_pad][..., :q_real]
-                k = out[..., q_pad:q_pad + k_pad][..., :k_real]
-                v = out[..., q_pad + k_pad:q_pad + k_pad + v_pad][..., :v_real]
-                out = torch.cat([q, k, v], dim=-1).contiguous()
-                if out_bias is not None and out_bias.numel() == total_pad:
-                    qb = out_bias[0:q_pad][:q_real]
-                    kb = out_bias[q_pad:q_pad + k_pad][:k_real]
-                    vb = out_bias[q_pad + k_pad:q_pad + k_pad + v_pad][:v_real]
-                    out_bias = torch.cat([qb, kb, vb], dim=-1).contiguous()
-            else:
-                # fallback: 保持原逻辑裁剪到 out_real（若 weight 上已有标记）
-                out_real = int(getattr(self.weight, "out_real", out.shape[-1]))
-                if out.shape[-1] != out_real:
-                    out = out[..., :out_real].contiguous()
-                    if out_bias is not None and out_bias.numel() != out_real:
-                        out_bias = out_bias[:out_real].contiguous()
+        out_real = int(getattr(self.weight, "out_real", out.shape[-1]))
+        if (not getattr(self, "_keep_out_pad", False)) and out.shape[-1] != out_real:
+            out = out[..., :out_real].contiguous()
+            if out_bias is not None and out_bias.numel() != out_real:
+                out_bias = out_bias[:out_real].contiguous()
 
         if not self.return_bias:
             return out
         return out, out_bias
-
 
 # ----------------------------
 # RowParallel: pad IN only in weight, forward pads input
@@ -631,8 +633,7 @@ class AscendQKVParallelLinear310(QKVParallelLinear):
         # per-head output padding (QKV)
         self._pad_in = False
         self._pad_out = True
-        # 默认保留 QKV padding，如需裁剪可设置 VLLM_ASCEND_KEEP_QKV_PAD=0
-        self._keep_out_pad = os.environ.get("VLLM_ASCEND_KEEP_QKV_PAD", "1") != "0"
+        self._keep_out_pad = True
         self._qkv_per_head_pad = True
         self._q_heads = self.num_heads
         self._kv_heads = self.num_kv_heads
@@ -844,3 +845,4 @@ __all__ = [
     "AscendQKVParallelLinear310",
     "AscendReplicatedLinear310",
 ]
+
