@@ -45,13 +45,21 @@ class AscendMMEncoderAttention310(AscendMMEncoderAttention):
         else:
             seq_len = torch.diff(cu_seqlens.to("cpu", dtype=torch.int32))
 
+        scale = getattr(self, "scale", None)
+        if scale is None:
+            head_size_orig = getattr(self, "head_size_orig", None)
+            if head_size_orig is not None:
+                scale = float(head_size_orig) ** -0.5
+            else:
+                scale = self.head_size**-0.5
+
         output = torch.empty_like(query)
         torch_npu._npu_flash_attention_unpad(
             query=query,
             key=key,
             value=value,
             seq_len=seq_len,
-            scale_value=self.head_size**-0.5,
+            scale_value=scale,
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
             out=output,

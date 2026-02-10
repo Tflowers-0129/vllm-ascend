@@ -19,7 +19,12 @@
 import torch
 import torch_npu
 
-from vllm_ascend.ops.rotary_embedding import AscendRotaryEmbedding, get_cos_and_sin_slice
+from vllm_ascend.ops.rotary_embedding import (
+    AscendApplyRotaryEmb,
+    AscendRotaryEmbedding,
+    MRotaryEmbedding,
+    get_cos_and_sin_slice,
+)
 
 
 def _rope_forward_oot(
@@ -106,3 +111,44 @@ class AscendMRotaryEmbedding310(MRotaryEmbedding):
         key: torch.Tensor,
     ):
         return super().forward_oot(positions, query, key)
+
+
+def _pad_cos_sin_for_head_dim(
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    need = head_dim // 2
+    if cos.shape[-1] == need:
+        return cos, sin
+    if cos.shape[-1] > need:
+        return cos[..., :need], sin[..., :need]
+    pad = need - cos.shape[-1]
+    cos_pad = torch.ones(*cos.shape[:-1], pad, device=cos.device, dtype=cos.dtype)
+    sin_pad = torch.zeros(*sin.shape[:-1], pad, device=sin.device, dtype=sin.dtype)
+    return torch.cat((cos, cos_pad), dim=-1), torch.cat((sin, sin_pad), dim=-1)
+
+
+def _apply_rotary_forward_oot_310(
+    self: AscendApplyRotaryEmb,
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> torch.Tensor:
+    x, cos, sin, origin_shape, origin_dtype = self._pre_process(x, cos, sin)
+
+    head_dim = x.shape[-1]
+    cos, sin = _pad_cos_sin_for_head_dim(cos, sin, head_dim)
+
+    cos = torch.cat((cos, cos), dim=-1)
+    sin = torch.cat((sin, sin), dim=-1)
+    cos = cos.reshape(1, -1, 1, head_dim)
+    sin = sin.reshape(1, -1, 1, head_dim)
+
+    output = torch_npu.npu_rotary_mul(x, cos, sin)
+    output = self._post_process(output, origin_shape, origin_dtype)
+    return output
+
+
+# Patch ApplyRotaryEmb for 310P to support padded head dims.
+AscendApplyRotaryEmb.forward_oot = _apply_rotary_forward_oot_310
