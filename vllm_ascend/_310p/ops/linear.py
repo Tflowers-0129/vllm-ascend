@@ -13,7 +13,7 @@ from typing import List, Optional
 import torch
 import torch.nn as nn
 import torch_npu
-from torch.nn.parameter import Parameter, UninitializedParameter
+from torch.nn.parameter import Parameter
 
 from vllm.distributed import (
     divide,
@@ -42,98 +42,110 @@ _NZ_FORMAT = 29
 # Minimal helpers
 # ----------------------------
 
-def _align_up(x: int, a: int = _ALIGN) -> int:
-    if a <= 0:
-        raise ValueError(f"align must be positive, got {a}")
-    return ((x + a - 1) // a) * a
+def _align_up(value: int, alignment: int = _ALIGN) -> int:
+    if alignment <= 0:
+        raise ValueError(f"alignment must be positive, got {alignment}")
+    return ((value + alignment - 1) // alignment) * alignment
 
 
-def _pad_last_dim(x: torch.Tensor, new_k: int) -> torch.Tensor:
-    k = int(x.shape[-1])
-    if k == new_k:
-        return x
-    if k > new_k:
-        raise RuntimeError(f"pad expects k<=new_k, got {k}>{new_k}")
-    pad = torch.zeros(*x.shape[:-1], new_k - k, device=x.device, dtype=x.dtype)
-    return torch.cat([x, pad], dim=-1)
+def _pad_last_dim(tensor: torch.Tensor, target_last_dim: int) -> torch.Tensor:
+    current_last_dim = int(tensor.shape[-1])
+    if current_last_dim == target_last_dim:
+        return tensor
+    if current_last_dim > target_last_dim:
+        raise RuntimeError(
+            f"pad expects current_last_dim<=target_last_dim, got {current_last_dim}>{target_last_dim}"
+        )
+    pad_width = target_last_dim - current_last_dim
+    padding = torch.zeros(*tensor.shape[:-1], pad_width, device=tensor.device, dtype=tensor.dtype)
+    return torch.cat([tensor, padding], dim=-1)
 
 
 def _load_2d_weight(
     param: Parameter,
     loaded_weight: torch.Tensor,
     *,
-    tp_dim: int,
-    tp_local: int,
-    out_real: int,
-    in_real: int,
-    out_off: int = 0,
+    partition_dim: int,
+    partition_size: int,
+    output_size: int,
+    input_size: int,
+    output_offset: int = 0,
     tp_rank: Optional[int] = None,
     tp_size: Optional[int] = None,
     prefix: str = "",
 ) -> None:
     """Slice (if needed) and copy a 2D weight into the padded storage."""
-    w = loaded_weight
-    if w.ndim != 2:
-        raise RuntimeError(f"expected 2D weight, got {w.ndim}D shape={tuple(w.shape)}")
+    if loaded_weight.ndim != 2:
+        raise RuntimeError(
+            f"expected 2D weight, got {loaded_weight.ndim}D shape={tuple(loaded_weight.shape)}"
+        )
 
+    weight_view = loaded_weight
     if tp_rank is not None and tp_size is not None:
-        if w.size(tp_dim) == tp_local * tp_size:
-            w = w.narrow(tp_dim, tp_rank * tp_local, tp_local)
-        elif w.size(tp_dim) != tp_local:
-            raise RuntimeError(f"[{prefix}] weight shard mismatch on dim {tp_dim}: got={w.size(tp_dim)} expect={tp_local}")
+        if weight_view.size(partition_dim) == partition_size * tp_size:
+            weight_view = weight_view.narrow(partition_dim, tp_rank * partition_size, partition_size)
+        elif weight_view.size(partition_dim) != partition_size:
+            raise RuntimeError(
+                f"[{prefix}] weight shard mismatch on dim {partition_dim}: "
+                f"got={weight_view.size(partition_dim)} expect={partition_size}"
+            )
 
-    if w.shape[0] < out_real or w.shape[1] < in_real:
-        raise RuntimeError(f"[{prefix}] weight too small: got={tuple(w.shape)} need=({out_real},{in_real})")
+    if weight_view.shape[0] < output_size or weight_view.shape[1] < input_size:
+        raise RuntimeError(
+            f"[{prefix}] weight too small: got={tuple(weight_view.shape)} need=({output_size},{input_size})"
+        )
 
-    param.data[out_off: out_off + out_real, :in_real].copy_(w[:out_real, :in_real])
+    param.data[output_offset: output_offset + output_size, :input_size].copy_(
+        weight_view[:output_size, :input_size]
+    )
 
 
 def _load_1d_or_scalar_param(
     *, param: Parameter, loaded_weight: torch.Tensor, tp_rank: Optional[int] = None, tp_size: Optional[int] = None
 ) -> bool:
     """Handle scalar/1D params (bias, scales). Return True if handled."""
-    w = loaded_weight.reshape(1) if loaded_weight.ndim == 0 else loaded_weight
-    p = param.data
+    loaded = loaded_weight.reshape(1) if loaded_weight.ndim == 0 else loaded_weight
+    param_data = param.data
 
     # scalar
-    if p.ndim == 0:
-        if w.numel() != 1:
-            raise RuntimeError(f"scalar expects 1 elem, got {tuple(w.shape)}")
-        p.copy_(w.reshape(()))
+    if param_data.ndim == 0:
+        if loaded.numel() != 1:
+            raise RuntimeError(f"scalar expects 1 elem, got {tuple(loaded.shape)}")
+        param_data.copy_(loaded.reshape(()))
         return True
 
     # 1D
-    if p.ndim != 1:
+    if param_data.ndim != 1:
         return False
-    if w.ndim != 1:
+    if loaded.ndim != 1:
         return False
 
-    if w.numel() == p.numel():
-        p.copy_(w)
+    if loaded.numel() == param_data.numel():
+        param_data.copy_(loaded)
         return True
 
     # allow loading smaller 1D params into padded storage
-    if w.numel() < p.numel():
-        p.zero_()
-        p[: w.numel()].copy_(w)
+    if loaded.numel() < param_data.numel():
+        param_data.zero_()
+        param_data[: loaded.numel()].copy_(loaded)
         return True
 
     # sometimes bias stored full -> slice per TP
-    if tp_rank is not None and tp_size is not None and w.numel() == p.numel() * int(tp_size):
-        start = int(tp_rank) * p.numel()
-        p.copy_(w.narrow(0, start, p.numel()))
+    if tp_rank is not None and tp_size is not None and loaded.numel() == param_data.numel() * int(tp_size):
+        start = int(tp_rank) * param_data.numel()
+        param_data.copy_(loaded.narrow(0, start, param_data.numel()))
         return True
 
     # global real -> local padded (slice then pad)
-    if tp_rank is not None and tp_size is not None and w.numel() % int(tp_size) == 0:
-        local = w.numel() // int(tp_size)
-        if local <= p.numel():
+    if tp_rank is not None and tp_size is not None and loaded.numel() % int(tp_size) == 0:
+        local = loaded.numel() // int(tp_size)
+        if local <= param_data.numel():
             start = int(tp_rank) * int(local)
-            p.zero_()
-            p[:local].copy_(w.narrow(0, start, int(local)))
-            return True
+            param_data.zero_()
+            param_data[:local].copy_(loaded.narrow(0, start, int(local)))
+        return True
 
-    raise RuntimeError(f"1D param mismatch: param={tuple(p.shape)} loaded={tuple(w.shape)}")
+    raise RuntimeError(f"1D param mismatch: param={tuple(param_data.shape)} loaded={tuple(loaded.shape)}")
 
 
 # ----------------------------
@@ -291,9 +303,6 @@ class AscendColumnParallelLinear310(ColumnParallelLinear):
                                     tp_rank=self.tp_rank, tp_size=self.tp_size):
             return
 
-        if getattr(param, "is_gguf_weight", False) and isinstance(param, UninitializedParameter):
-            param.materialize(tuple(param.data.shape), dtype=loaded_weight.dtype)
-
         out_dim = int(getattr(param, "output_dim", 0))
         in_real = int(getattr(param, "in_real"))
         out_real = int(getattr(param, "out_real"))
@@ -301,11 +310,11 @@ class AscendColumnParallelLinear310(ColumnParallelLinear):
         _load_2d_weight(
             param,
             loaded_weight,
-            tp_dim=out_dim,
-            tp_local=out_real,
-            out_real=out_real,
-            in_real=in_real,
-            out_off=0,
+            partition_dim=out_dim,
+            partition_size=out_real,
+            output_size=out_real,
+            input_size=in_real,
+            output_offset=0,
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
             prefix=self.prefix,
@@ -389,11 +398,11 @@ class AscendRowParallelLinear310(RowParallelLinear):
         _load_2d_weight(
             param,
             loaded_weight,
-            tp_dim=in_dim,
-            tp_local=in_real,
-            out_real=out_real,
-            in_real=in_real,
-            out_off=0,
+            partition_dim=in_dim,
+            partition_size=in_real,
+            output_size=out_real,
+            input_size=in_real,
+            output_offset=0,
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
             prefix=self.prefix,
@@ -464,11 +473,11 @@ class AscendMergedColumnParallelLinear310(MergedColumnParallelLinear):
         _load_2d_weight(
             param,
             loaded_weight,
-            tp_dim=out_dim,
-            tp_local=int(part_local),
-            out_real=int(part_local),
-            in_real=in_real,
-            out_off=int(out_off),
+            partition_dim=out_dim,
+            partition_size=int(part_local),
+            output_size=int(part_local),
+            input_size=in_real,
+            output_offset=int(out_off),
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
             prefix=self.prefix,
@@ -513,11 +522,11 @@ class AscendReplicatedLinear310(ReplicatedLinear):
         _load_2d_weight(
             param,
             loaded_weight,
-            tp_dim=0,
-            tp_local=out_real,
-            out_real=out_real,
-            in_real=in_real,
-            out_off=0,
+            partition_dim=0,
+            partition_size=out_real,
+            output_size=out_real,
+            input_size=in_real,
+            output_offset=0,
             tp_rank=None,
             tp_size=None,
             prefix=self.prefix,
