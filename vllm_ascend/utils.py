@@ -634,7 +634,6 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
             AscendColumnParallelLinear310,
             AscendRowParallelLinear310,
             AscendMergedColumnParallelLinear310,
-            AscendQKVParallelLinear310,
             AscendReplicatedLinear310,
         )
 
@@ -652,7 +651,7 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
                 "ColumnParallelLinear": AscendColumnParallelLinear310,
                 "RowParallelLinear": AscendRowParallelLinear310,
                 "MergedColumnParallelLinear": AscendMergedColumnParallelLinear310,
-                "QKVParallelLinear": AscendQKVParallelLinear310,
+                "QKVParallelLinear": AscendQKVParallelLinear,
                 "ReplicatedLinear": AscendReplicatedLinear310,
             }
         )

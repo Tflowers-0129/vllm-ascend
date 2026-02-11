@@ -16,7 +16,6 @@ from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     LinearBase,
     MergedColumnParallelLinear,
-    QKVParallelLinear,
     QuantizeMethodBase,
     ReplicatedLinear,
     RowParallelLinear,
@@ -123,7 +122,6 @@ class AscendUnquantizedLinearMethod310(UnquantizedLinearMethod):
     Flags set by layer:
       - layer._pad_in  : pad K (weight input dim) to 16
       - layer._pad_out : pad N (weight output dim) to 16 (per-part for merged)
-      - layer._qkv_per_head_pad : QKV special per-head pad on OUT
     """
 
     def create_weights(
@@ -140,35 +138,6 @@ class AscendUnquantizedLinearMethod310(UnquantizedLinearMethod):
 
         in_real = int(input_size_per_partition)
         in_pad = _align_up(in_real) if getattr(layer, "_pad_in", False) else in_real
-
-        # ---- QKV special allocation ----
-        if getattr(layer, "_qkv_per_head_pad", False):
-            parts_real = list(map(int, layer._qkv_parts_real))  # [q,k,v] local real rows
-            parts_pad  = list(map(int, layer._qkv_parts_pad))   # [q,k,v] local padded rows
-
-            out_real = sum(parts_real)
-            out_pad  = sum(parts_pad)
-
-            weight = Parameter(torch.zeros((out_pad, in_pad), dtype=params_dtype), requires_grad=False)
-            layer.register_parameter("weight", weight)
-
-            set_weight_attrs(weight, dict(
-                input_dim=1, output_dim=0,
-                weight_loader=weight_loader,
-                in_real=in_real, in_pad=in_pad,
-                out_real=out_real, out_pad=out_pad,
-                parts_real=parts_real, parts_pad=parts_pad,
-                # QKV meta needed by loader:
-                q_heads=int(layer._q_heads),
-                kv_heads=int(layer._kv_heads),
-                head_size=int(layer._head_size),
-                head_size_pad=int(layer._head_size_pad),
-                v_head_size=int(layer._v_head_size),
-                v_head_size_pad=int(layer._v_head_size_pad),
-            ))
-            if extra_weight_attrs:
-                set_weight_attrs(weight, extra_weight_attrs)
-            return
 
         # ---- generic allocation ----
         parts_real = list(map(int, output_partition_sizes))  # local parts
@@ -469,190 +438,6 @@ class AscendMergedColumnParallelLinear310(MergedColumnParallelLinear):
 
 
 # ----------------------------
-# QKVParallelLinear: per-head OUT pad + scatter copy
-# ----------------------------
-
-class AscendQKVParallelLinear310(QKVParallelLinear):
-    def __init__(self, hidden_size: int, head_size: int, total_num_heads: int,
-                 total_num_kv_heads: Optional[int] = None, bias: bool = True,
-                 skip_bias_add: bool = False, params_dtype: Optional[torch.dtype] = None,
-                 quant_config: Optional[QuantizationConfig] = None, prefix: str = "",
-                 *, return_bias: bool = True, disable_tp: bool = False,
-                 v_head_size: Optional[int] = None):
-        # mimic vllm QKV init but route to 310P column impl
-        self.v_head_size = v_head_size if v_head_size is not None else head_size
-        tp_size = 1 if disable_tp else get_tensor_model_parallel_world_size()
-
-        self.hidden_size = hidden_size
-        self.head_size = head_size
-        self.total_num_heads = total_num_heads
-        if total_num_kv_heads is None:
-            total_num_kv_heads = total_num_heads
-        self.total_num_kv_heads = total_num_kv_heads
-
-        self.num_heads = divide(self.total_num_heads, tp_size)
-        if tp_size >= self.total_num_kv_heads:
-            self.num_kv_heads = 1
-            self.num_kv_head_replicas = divide(tp_size, self.total_num_kv_heads)
-        else:
-            self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
-            self.num_kv_head_replicas = 1
-
-        input_size = self.hidden_size
-        output_size = (
-            self.num_heads * self.head_size
-            + self.num_kv_heads * self.head_size
-            + self.num_kv_heads * self.v_head_size
-        ) * tp_size
-        self.output_sizes = [
-            self.num_heads * self.head_size * tp_size,
-            self.num_kv_heads * self.head_size * tp_size,
-            self.num_kv_heads * self.v_head_size * tp_size,
-        ]
-
-        # per-head output padding (QKV)
-        self._pad_in = False
-        self._pad_out = False
-        self._keep_out_pad = False
-        self._qkv_per_head_pad = True
-        self._q_heads = self.num_heads
-        self._kv_heads = self.num_kv_heads
-        self._head_size = self.head_size
-        self._v_head_size = self.v_head_size
-        self._head_size_pad = int(self.head_size)
-        self._v_head_size_pad = int(self.v_head_size)
-        self._qkv_parts_real = [
-            self.num_heads * self.head_size,
-            self.num_kv_heads * self.head_size,
-            self.num_kv_heads * self.v_head_size,
-        ]
-        self._qkv_parts_pad = [
-            self.num_heads * self._head_size_pad,
-            self.num_kv_heads * self._head_size_pad,
-            self.num_kv_heads * self._v_head_size_pad,
-        ]
-
-        AscendColumnParallelLinear310.__init__(
-            self,
-            input_size=input_size,
-            output_size=output_size,
-            bias=bias,
-            gather_output=False,
-            skip_bias_add=skip_bias_add,
-            params_dtype=params_dtype,
-            quant_config=quant_config,
-            prefix=prefix,
-            return_bias=return_bias,
-            disable_tp=disable_tp,
-        )
-
-    def _kv_shard_rank(self) -> int:
-        replicas = int(getattr(self, "num_kv_head_replicas", 1))
-        if replicas <= 1:
-            return int(self.tp_rank)
-        return int(self.tp_rank) // replicas
-
-    def _scatter_per_head(self, *, dst: torch.Tensor, dst_off: int, heads: int,
-                          head_real: int, head_pad: int, src: torch.Tensor, in_real: int) -> None:
-        part = dst.narrow(0, dst_off, heads * head_pad).view(heads, head_pad, -1)
-        src = src[:, :in_real].contiguous().view(heads, head_real, in_real)
-        part[:, :head_real, :in_real].copy_(src)
-
-    def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor, loaded_shard_id: Optional[str] = None, *_, **__):
-        if _load_1d_or_scalar_param(param=param, loaded_weight=loaded_weight,
-                                    tp_rank=self.tp_rank, tp_size=self.tp_size):
-            return
-
-        w = loaded_weight
-        if w.ndim != 2:
-            raise RuntimeError("QKV weight_loader expects 2D")
-
-        out_dim = int(getattr(param, "output_dim", 0))
-        in_real = int(getattr(param, "in_real"))
-
-        q_pad, k_pad, v_pad = map(int, getattr(param, "parts_pad"))
-        q_off, k_off, v_off = 0, q_pad, q_pad + k_pad
-
-        q_heads = int(getattr(param, "q_heads"))
-        kv_heads = int(getattr(param, "kv_heads"))
-        head_real = int(getattr(param, "head_size"))
-        head_pad  = int(getattr(param, "head_size_pad"))
-        v_head_real = int(getattr(param, "v_head_size"))
-        v_head_pad  = int(getattr(param, "v_head_size_pad"))
-
-        def narrow_tp(seg: torch.Tensor, shard: str) -> torch.Tensor:
-            if shard == "q":
-                local = q_heads * head_real
-                global_ = int(self.total_num_heads * self.head_size)
-                rank = int(self.tp_rank)
-            elif shard == "k":
-                local = kv_heads * head_real
-                global_ = int(self.total_num_kv_heads * self.head_size)
-                rank = self._kv_shard_rank()
-            else:  # "v"
-                local = kv_heads * v_head_real
-                global_ = int(self.total_num_kv_heads * self.v_head_size)
-                rank = self._kv_shard_rank()
-
-            if seg.size(out_dim) == local:
-                return seg
-            if seg.size(out_dim) == global_:
-                return seg.narrow(out_dim, int(rank) * int(local), int(local))
-            raise RuntimeError(f"[{self.prefix}] QKV shard {shard} mismatch")
-
-        # fused on disk: [Q_global; K_global; V_global]
-        if loaded_shard_id is None:
-            qg, kg, vg = self.output_sizes
-            if w.size(out_dim) != qg + kg + vg:
-                raise RuntimeError(f"[{self.prefix}] fused QKV rows mismatch")
-
-            q_full = w.narrow(out_dim, 0, qg)
-            k_full = w.narrow(out_dim, qg, kg)
-            v_full = w.narrow(out_dim, qg + kg, vg)
-
-            q_seg = narrow_tp(q_full, "q")
-            k_seg = narrow_tp(k_full, "k")
-            v_seg = narrow_tp(v_full, "v")
-
-            self._scatter_per_head(dst=param.data, dst_off=q_off, heads=q_heads,
-                                   head_real=head_real, head_pad=head_pad, src=q_seg, in_real=in_real)
-            self._scatter_per_head(dst=param.data, dst_off=k_off, heads=kv_heads,
-                                   head_real=head_real, head_pad=head_pad, src=k_seg, in_real=in_real)
-            self._scatter_per_head(dst=param.data, dst_off=v_off, heads=kv_heads,
-                                   head_real=v_head_real, head_pad=v_head_pad, src=v_seg, in_real=in_real)
-            return
-
-        sid = str(loaded_shard_id)
-        seg = narrow_tp(w, sid)
-        if sid == "q":
-            self._scatter_per_head(dst=param.data, dst_off=q_off, heads=q_heads,
-                                   head_real=head_real, head_pad=head_pad, src=seg, in_real=in_real)
-        elif sid == "k":
-            self._scatter_per_head(dst=param.data, dst_off=k_off, heads=kv_heads,
-                                   head_real=head_real, head_pad=head_pad, src=seg, in_real=in_real)
-        elif sid == "v":
-            self._scatter_per_head(dst=param.data, dst_off=v_off, heads=kv_heads,
-                                   head_real=v_head_real, head_pad=v_head_pad, src=seg, in_real=in_real)
-        else:
-            raise RuntimeError("loaded_shard_id must be q/k/v")
-
-    def forward(self, input_: torch.Tensor):
-        bias = None if self.skip_bias_add else self.bias
-        out = self.quant_method.apply(self, input_, bias)
-        out_bias = self.bias if self.skip_bias_add else None
-
-        out_real = int(getattr(self.weight, "out_real", out.shape[-1]))
-        if (not getattr(self, "_keep_out_pad", False)) and out.shape[-1] != out_real:
-            out = out[..., :out_real].contiguous()
-            if out_bias is not None and out_bias.numel() != out_real:
-                out_bias = out_bias[:out_real].contiguous()
-
-        if not self.return_bias:
-            return out
-        return out, out_bias
-
-
-# ----------------------------
 # Replicated
 # ----------------------------
 
@@ -714,7 +499,6 @@ __all__ = [
     "AscendColumnParallelLinear310",
     "AscendRowParallelLinear310",
     "AscendMergedColumnParallelLinear310",
-    "AscendQKVParallelLinear310",
     "AscendReplicatedLinear310",
 ]
 
