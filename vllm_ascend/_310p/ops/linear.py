@@ -1,5 +1,13 @@
 from __future__ import annotations
 
+"""
+310P linear overrides.
+
+Design goal:
+Only the MLP path (gate_up and down_proj) uses padding alignment to satisfy
+hardware constraints. QKV and other linears follow the default behavior.
+"""
+
 from typing import List, Optional
 
 import torch
@@ -26,7 +34,7 @@ from vllm.model_executor.utils import set_weight_attrs
 
 
 _ALIGN = 16
-_MLP_ALIGN = 32
+_MLP_ALIGN = 32  # ensures each half of SwiGLU is 64B-aligned for bf16/fp16
 _NZ_FORMAT = 29
 
 
@@ -35,7 +43,9 @@ _NZ_FORMAT = 29
 # ----------------------------
 
 def _align_up(x: int, a: int = _ALIGN) -> int:
-    return ((x + a - 1) // a) * a if a > 0 else x
+    if a <= 0:
+        raise ValueError(f"align must be positive, got {a}")
+    return ((x + a - 1) // a) * a
 
 
 def _pad_last_dim(x: torch.Tensor, new_k: int) -> torch.Tensor:
@@ -48,22 +58,34 @@ def _pad_last_dim(x: torch.Tensor, new_k: int) -> torch.Tensor:
     return torch.cat([x, pad], dim=-1)
 
 
-def _copy_2d(dst: torch.Tensor, src: torch.Tensor, *, out_off: int, out_real: int, in_real: int) -> None:
-    # dst: [out_pad, in_pad], src: [>=out_real, >=in_real]
-    if src.ndim != 2:
-        raise RuntimeError(f"expected 2D weight, got {src.ndim}D shape={tuple(src.shape)}")
-    if src.shape[0] < out_real or src.shape[1] < in_real:
-        raise RuntimeError(f"src too small: src={tuple(src.shape)} need=({out_real},{in_real})")
-    dst[out_off: out_off + out_real, :in_real].copy_(src[:out_real, :in_real])
+def _load_2d_weight(
+    param: Parameter,
+    loaded_weight: torch.Tensor,
+    *,
+    tp_dim: int,
+    tp_local: int,
+    out_real: int,
+    in_real: int,
+    out_off: int = 0,
+    tp_rank: Optional[int] = None,
+    tp_size: Optional[int] = None,
+    prefix: str = "",
+) -> None:
+    """Slice (if needed) and copy a 2D weight into the padded storage."""
+    w = loaded_weight
+    if w.ndim != 2:
+        raise RuntimeError(f"expected 2D weight, got {w.ndim}D shape={tuple(w.shape)}")
 
+    if tp_rank is not None and tp_size is not None:
+        if w.size(tp_dim) == tp_local * tp_size:
+            w = w.narrow(tp_dim, tp_rank * tp_local, tp_local)
+        elif w.size(tp_dim) != tp_local:
+            raise RuntimeError(f"[{prefix}] weight shard mismatch on dim {tp_dim}: got={w.size(tp_dim)} expect={tp_local}")
 
-def _maybe_tp_slice(w: torch.Tensor, dim: int, *, local: int, rank: int, tp: int) -> torch.Tensor:
-    """If w is global on `dim`, slice to local for this rank; else keep as-is."""
-    if w.size(dim) == local:
-        return w
-    if w.size(dim) == local * tp:
-        return w.narrow(dim, rank * local, local)
-    return w  # caller will validate
+    if w.shape[0] < out_real or w.shape[1] < in_real:
+        raise RuntimeError(f"[{prefix}] weight too small: got={tuple(w.shape)} need=({out_real},{in_real})")
+
+    param.data[out_off: out_off + out_real, :in_real].copy_(w[:out_real, :in_real])
 
 
 def _load_1d_or_scalar_param(
@@ -269,22 +291,25 @@ class AscendColumnParallelLinear310(ColumnParallelLinear):
                                     tp_rank=self.tp_rank, tp_size=self.tp_size):
             return
 
-        w = loaded_weight
         if getattr(param, "is_gguf_weight", False) and isinstance(param, UninitializedParameter):
-            param.materialize(tuple(param.data.shape), dtype=w.dtype)
+            param.materialize(tuple(param.data.shape), dtype=loaded_weight.dtype)
 
         out_dim = int(getattr(param, "output_dim", 0))
         in_real = int(getattr(param, "in_real"))
         out_real = int(getattr(param, "out_real"))
 
-        if w.ndim != 2:
-            raise RuntimeError("Column weight_loader expects 2D")
-
-        w = _maybe_tp_slice(w, out_dim, local=out_real, rank=int(self.tp_rank), tp=int(self.tp_size))
-        if w.size(out_dim) != out_real:
-            raise RuntimeError(f"[{self.prefix}] Column out mismatch: got={w.size(out_dim)} expect={out_real}")
-
-        _copy_2d(param.data, w, out_off=0, out_real=out_real, in_real=in_real)
+        _load_2d_weight(
+            param,
+            loaded_weight,
+            tp_dim=out_dim,
+            tp_local=out_real,
+            out_real=out_real,
+            in_real=in_real,
+            out_off=0,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            prefix=self.prefix,
+        )
 
     def forward(self, input_: torch.Tensor):
         bias = None if self.skip_bias_add else self.bias
@@ -357,19 +382,22 @@ class AscendRowParallelLinear310(RowParallelLinear):
         if _load_1d_or_scalar_param(param=param, loaded_weight=loaded_weight):
             return
 
-        w = loaded_weight
-        if w.ndim != 2:
-            raise RuntimeError("Row weight_loader expects 2D")
-
         in_dim = int(getattr(param, "input_dim", 1))
         in_real = int(getattr(param, "in_real"))
         out_real = int(getattr(param, "out_real"))
 
-        w = _maybe_tp_slice(w, in_dim, local=in_real, rank=int(self.tp_rank), tp=int(self.tp_size))
-        if w.size(in_dim) != in_real:
-            raise RuntimeError(f"[{self.prefix}] Row in mismatch: got={w.size(in_dim)} expect={in_real}")
-
-        _copy_2d(param.data, w, out_off=0, out_real=out_real, in_real=in_real)
+        _load_2d_weight(
+            param,
+            loaded_weight,
+            tp_dim=in_dim,
+            tp_local=in_real,
+            out_real=out_real,
+            in_real=in_real,
+            out_off=0,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            prefix=self.prefix,
+        )
 
     def forward(self, input_: torch.Tensor, **_):
         x = input_
@@ -415,10 +443,6 @@ class AscendMergedColumnParallelLinear310(MergedColumnParallelLinear):
                                     tp_rank=self.tp_rank, tp_size=self.tp_size):
             return
 
-        w = loaded_weight
-        if w.ndim != 2:
-            raise RuntimeError("MergedColumn weight_loader expects 2D")
-
         out_dim = int(getattr(param, "output_dim", 0))
         in_real = int(getattr(param, "in_real"))
         parts_pad = list(map(int, getattr(param, "parts_pad")))
@@ -436,12 +460,19 @@ class AscendMergedColumnParallelLinear310(MergedColumnParallelLinear):
         part_global = int(self.output_sizes[sid])
         part_local = part_global // int(self.tp_size)
 
-        seg = _maybe_tp_slice(w, out_dim, local=int(part_local), rank=int(self.tp_rank), tp=int(self.tp_size))
-        if seg.size(out_dim) != int(part_local):
-            raise RuntimeError(f"[{self.prefix}] gate_up part{sid} mismatch")
-
         out_off = sum(parts_pad[:sid])
-        _copy_2d(param.data, seg, out_off=int(out_off), out_real=int(part_local), in_real=in_real)
+        _load_2d_weight(
+            param,
+            loaded_weight,
+            tp_dim=out_dim,
+            tp_local=int(part_local),
+            out_real=int(part_local),
+            in_real=in_real,
+            out_off=int(out_off),
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            prefix=self.prefix,
+        )
 
 
 # ----------------------------
@@ -477,11 +508,20 @@ class AscendReplicatedLinear310(ReplicatedLinear):
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor, *_, **__):
         if _load_1d_or_scalar_param(param=param, loaded_weight=loaded_weight):
             return
-        if loaded_weight.ndim != 2:
-            raise RuntimeError("Replicated weight_loader expects 2D")
         in_real = int(getattr(param, "in_real"))
         out_real = int(getattr(param, "out_real"))
-        _copy_2d(param.data, loaded_weight, out_off=0, out_real=out_real, in_real=in_real)
+        _load_2d_weight(
+            param,
+            loaded_weight,
+            tp_dim=0,
+            tp_local=out_real,
+            out_real=out_real,
+            in_real=in_real,
+            out_off=0,
+            tp_rank=None,
+            tp_size=None,
+            prefix=self.prefix,
+        )
 
     def forward(self, input_: torch.Tensor):
         in_real = int(getattr(self.weight, "in_real", input_.shape[-1]))
