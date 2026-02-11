@@ -25,6 +25,11 @@ from vllm_ascend.utils import get_weight_prefetch_method
 class AscendSiluAndMul310(AscendSiluAndMul):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         weight_prefetch_method = get_weight_prefetch_method()
+
+        orig_shape = x.shape
+        if x.dim() > 2:
+            x = x.contiguous().view(-1, orig_shape[-1])
+
         if weight_prefetch_method:
             weight_prefetch_method.maybe_prefetch_mlp_weight_preprocess(
                 weight_prefetch_method.MLP_DOWN, x
@@ -32,4 +37,7 @@ class AscendSiluAndMul310(AscendSiluAndMul):
         out = torch_npu.npu_swiglu(x)
         if weight_prefetch_method:
             weight_prefetch_method.maybe_prefetch_mlp_weight_postprocess(out)
+
+        if len(orig_shape) > 2:
+            out = out.view(*orig_shape[:-1], out.shape[-1])
         return out

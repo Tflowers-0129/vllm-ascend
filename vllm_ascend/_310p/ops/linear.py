@@ -26,6 +26,7 @@ from vllm.model_executor.utils import set_weight_attrs
 
 
 _ALIGN = 16
+_MLP_ALIGN = 32
 _NZ_FORMAT = 29
 
 
@@ -137,7 +138,11 @@ class AscendUnquantizedLinearMethod310(UnquantizedLinearMethod):
         weight_loader = extra_weight_attrs.pop("weight_loader")
 
         in_real = int(input_size_per_partition)
-        in_pad = _align_up(in_real) if getattr(layer, "_pad_in", False) else in_real
+        if getattr(layer, "_pad_in", False):
+            align = int(getattr(layer, "_pad_in_align", _ALIGN))
+            in_pad = _align_up(in_real, align)
+        else:
+            in_pad = in_real
 
         # ---- generic allocation ----
         parts_real = list(map(int, output_partition_sizes))  # local parts
@@ -314,6 +319,8 @@ class AscendRowParallelLinear310(RowParallelLinear):
         self.output_partition_sizes = [int(output_size)]
 
         self._pad_in = "down_proj" in prefix
+        if self._pad_in:
+            self._pad_in_align = _MLP_ALIGN
         self._pad_out = False
 
         AscendLinearBase310.__init__(self, input_size, output_size,
@@ -393,7 +400,7 @@ class AscendRowParallelLinear310(RowParallelLinear):
 class AscendMergedColumnParallelLinear310(MergedColumnParallelLinear):
     def __init__(self, input_size: int, output_sizes: List[int], **kwargs):
         self.output_sizes = list(map(int, output_sizes))
-        self._force_part_align = [_ALIGN] * len(self.output_sizes)
+        self._force_part_align = [_MLP_ALIGN] * len(self.output_sizes)
         self._keep_out_pad = True
         self._pad_out = True
         AscendColumnParallelLinear310.__init__(
