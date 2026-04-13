@@ -74,4 +74,3 @@ def test_set_mrope_apply_rotary_slices_reuses_buffer_address():
 
     assert first_ptr == second_ptr
 
-
