@@ -17,6 +17,9 @@
 # mypy: ignore-errors
 
 
+import os
+from pathlib import Path
+
 import torch
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.models.qwen3_5 import Qwen3_5GatedDeltaNet
@@ -28,7 +31,76 @@ from vllm_ascend._310p.ops.fla.chunk_gated_delta_rule import chunk_gated_delta_r
 from vllm_ascend._310p.ops.fla.fused_gdn_gating import fused_gdn_gating_pytorch
 from vllm_ascend._310p.ops.fla.fused_recurrent_gated_delta_rule import fused_recurrent_gated_delta_rule_pytorch
 from vllm_ascend.attention.utils import maybe_save_kv_layer_to_connector
-from vllm_ascend.utils import enable_sp
+from vllm_ascend.utils import enable_sp, parse_layer_idx
+
+
+_DUMP_ROOT = Path(__file__).resolve().parents[3] / "causal_conv1d_dump"
+_DUMP_STEP = 0
+
+
+def _detach_cpu(x: torch.Tensor | None) -> torch.Tensor | None:
+    if x is None:
+        return None
+    return x.detach().cpu().contiguous()
+
+
+def _canonical_conv_weight(weight: torch.Tensor, feature_dim: int) -> torch.Tensor:
+    if weight.shape[0] == feature_dim:
+        return weight
+    return weight.transpose(0, 1)
+
+
+def _select_conv_state(conv_state: torch.Tensor, cache_indices: torch.Tensor, feature_dim: int) -> torch.Tensor:
+    state = conv_state.index_select(0, cache_indices.to(torch.long))
+    if state.shape[-2] == feature_dim:
+        return state
+    return state.transpose(-1, -2)
+
+
+def _should_dump_causal_conv1d(
+    forward_context,
+    prefix: str,
+    attn_metadata: GDNAttentionMetadata,
+) -> bool:
+    return (
+        parse_layer_idx(prefix) == 0
+        and attn_metadata.num_prefills == 0
+        and attn_metadata.num_decodes > 0
+        and not getattr(forward_context, "in_profile_run", False)
+        and not getattr(forward_context, "capturing", False)
+    )
+
+
+def _dump_causal_conv1d(
+    prefix: str,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    conv_state_before: torch.Tensor,
+    y: torch.Tensor,
+    conv_state_after: torch.Tensor,
+    cache_indices: torch.Tensor,
+) -> None:
+    global _DUMP_STEP
+
+    dump_dir = _DUMP_ROOT / f"pid_{os.getpid()}"
+    dump_dir.mkdir(parents=True, exist_ok=True)
+    dump_path = dump_dir / f"step_{_DUMP_STEP:06d}.pt"
+    torch.save(
+        {
+            "step": _DUMP_STEP,
+            "prefix": prefix,
+            "input": _detach_cpu(x),
+            "weight": _detach_cpu(weight),
+            "bias": _detach_cpu(bias),
+            "cache_indices": _detach_cpu(cache_indices.to(torch.int64)),
+            "conv_state_before": _detach_cpu(conv_state_before),
+            "output": _detach_cpu(y),
+            "conv_state_after": _detach_cpu(conv_state_after),
+        },
+        dump_path,
+    )
+    _DUMP_STEP += 1
 
 
 class Ascend310Qwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
@@ -118,14 +190,33 @@ class Ascend310Qwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
                     query_start_loc=non_spec_query_start_loc,
                 ).transpose(0, 1)
         elif attn_metadata.num_decodes > 0:
+            non_spec_cache_indices = non_spec_state_indices_tensor[: attn_metadata.num_actual_tokens]
+            should_dump = _should_dump_causal_conv1d(forward_context, self.prefix, attn_metadata)
+            if should_dump:
+                dump_input = mixed_qkv_non_spec.detach().clone()
+                feature_dim = mixed_qkv_non_spec.shape[-1]
+                conv_weight_dump = _canonical_conv_weight(conv_weights, feature_dim)
+                conv_state_before = _select_conv_state(conv_state, non_spec_cache_indices, feature_dim)
             mixed_qkv_non_spec = causal_conv1d_update(
                 mixed_qkv_non_spec,
                 conv_state,
                 conv_weights,
                 self.conv1d.bias,
                 self.activation,
-                conv_state_indices=non_spec_state_indices_tensor[: attn_metadata.num_actual_tokens],
+                conv_state_indices=non_spec_cache_indices,
             )
+            if should_dump:
+                conv_state_after = _select_conv_state(conv_state, non_spec_cache_indices, feature_dim)
+                _dump_causal_conv1d(
+                    prefix=self.prefix,
+                    x=dump_input,
+                    weight=conv_weight_dump,
+                    bias=self.conv1d.bias,
+                    conv_state_before=conv_state_before,
+                    y=mixed_qkv_non_spec,
+                    conv_state_after=conv_state_after,
+                    cache_indices=non_spec_cache_indices,
+                )
         else:
             mixed_qkv_non_spec = None
         query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
