@@ -25,6 +25,7 @@ import torch.nn as nn
 from torch.nn.parameter import Parameter
 from vllm.config import get_current_vllm_config
 from vllm.distributed import divide
+from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.linear import (  # noqa
     WEIGHT_LOADER_V2_SUPPORTED,
     ColumnParallelLinear,
@@ -487,3 +488,7 @@ class AscendReplicatedLinear(ReplicatedLinear):
             return self.custom_op.apply(input_)
 
         return super().forward(input_)
+
+
+class AscendGateLinear(GateLinear, AscendReplicatedLinear):
+    """Reuse GateLinear routing behavior with Ascend replicated linear fallback."""

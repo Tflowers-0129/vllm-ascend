@@ -27,6 +27,30 @@ from vllm_ascend.compilation.passes.base_pattern import BasePattern
 from vllm_ascend.utils import get_rope_dim
 
 
+def _uses_proportional_rope(hf_text_config) -> bool:
+    rope_parameters = getattr(hf_text_config, "rope_parameters", None)
+    if not isinstance(rope_parameters, dict):
+        return False
+
+    if rope_parameters.get("rope_type") == "proportional":
+        return True
+
+    return any(
+        isinstance(params, dict) and params.get("rope_type") == "proportional"
+        for params in rope_parameters.values()
+    )
+
+
+def _has_heterogeneous_head_dims(hf_text_config) -> bool:
+    head_dim = getattr(hf_text_config, "head_dim", None)
+    global_head_dim = getattr(hf_text_config, "global_head_dim", None)
+    return (
+        head_dim is not None
+        and global_head_dim is not None
+        and head_dim != global_head_dim
+    )
+
+
 class QKNormRopeFusionPattern(BasePattern):
     def __init__(self, vllm_config, head_dim, num_heads, num_kv_heads, eps=1e-6):
         super().__init__(vllm_config, eps)
@@ -191,6 +215,16 @@ class QKNormRopeFusionPass(VllmInductorPass):
     def __init__(self, vllm_config: VllmConfig):
         super().__init__(vllm_config)
         self.pattern_match_passes: PatternMatcherPass = PatternMatcherPass(pass_name="qknorm_rope_fusion_pass")
+
+        hf_text_config = getattr(vllm_config.model_config, "hf_text_config", None)
+        if hf_text_config is not None and (
+            _uses_proportional_rope(hf_text_config)
+            or _has_heterogeneous_head_dims(hf_text_config)
+        ):
+            logger.debug(
+                "QKNorm and Rope fusion not enabled: proportional rope or heterogeneous head dimensions detected."
+            )
+            return
 
         dtype = vllm_config.model_config.dtype
         if dtype not in (torch.bfloat16,):

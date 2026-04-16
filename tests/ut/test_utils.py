@@ -25,7 +25,6 @@ from vllm.config import (CompilationConfig, ModelConfig, ParallelConfig,
 
 from tests.ut.base import TestBase
 from vllm_ascend import utils
-from vllm_ascend.utils import REGISTERED_ASCEND_OPS
 
 
 class TestUtils(TestBase):
@@ -267,13 +266,15 @@ class TestUtils(TestBase):
         # ascend custom op is not registered
         utils.register_ascend_customop()
         self.assertEqual(mock_customop.register_oot.call_count,
-                         len(REGISTERED_ASCEND_OPS))
+                         len(utils.REGISTERED_ASCEND_OPS))
         self.assertTrue(utils._ASCEND_CUSTOMOP_IS_REIGISTERED)
+        self.assertIn("Gemma4RotaryEmbedding", utils.REGISTERED_ASCEND_OPS)
+        self.assertIn("GateLinear", utils.REGISTERED_ASCEND_OPS)
 
         # ascend custom op is already registered
         utils.register_ascend_customop()
         self.assertEqual(mock_customop.register_oot.call_count,
-                         len(REGISTERED_ASCEND_OPS))
+                         len(utils.REGISTERED_ASCEND_OPS))
     
     @mock.patch("torch_npu.npu_format_cast")
     def test_maybe_trans_nz(self, mock_npu_format_cast):
