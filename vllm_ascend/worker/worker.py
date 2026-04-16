@@ -58,6 +58,8 @@ from vllm_ascend.utils import (
     check_ascend_device_type,
     enable_sp,
     get_ascend_device_type,
+    get_available_memory,
+    is_rc_device,
     register_ascend_customop,
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
@@ -265,6 +267,9 @@ class NPUWorker(WorkerBase):
         # take current memory snapshot
         self.init_snapshot = MemorySnapshot()
         self.requested_memory = self.init_snapshot.total_memory * self.cache_config.gpu_memory_utilization
+        if is_rc_device():
+            self.init_snapshot.free_memory = get_available_memory()
+            logger.info("NPU device is working in Root Complex (RC) mode.")
         if self.init_snapshot.free_memory < self.requested_memory:
             GiB = lambda b: round(b / GiB_bytes, 2)
             raise ValueError(

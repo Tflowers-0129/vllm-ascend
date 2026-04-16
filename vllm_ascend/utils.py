@@ -23,6 +23,7 @@ import atexit
 import functools
 import math
 import os
+import subprocess
 from contextlib import nullcontext
 from enum import Enum
 from functools import lru_cache
@@ -77,6 +78,15 @@ _HAS_ROPE = None
 
 def is_310p():
     return get_ascend_device_type() == AscendDeviceType._310P
+
+
+def is_rc_device():
+    result = subprocess.run(["lspci"], capture_output=True, text=True)
+    return not any("accelerators" in line.strip() for line in result.stdout.splitlines())
+
+
+def get_available_memory():
+    return int(subprocess.check_output(["free", "-b"]).splitlines()[1].split()[-1])
 
 
 def _print_callback_on_stream(*args):
