@@ -40,6 +40,7 @@ from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm_ascend._310p.npu_input_batch import NPUInputBatch310 as NPUInputBatch
 from vllm_ascend._310p.sample.sampler import AscendSampler310
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 _NGRAM_GRAPH_UNIFORM_DECODE_QUERY_LEN = 1
@@ -69,6 +70,7 @@ class NPUModelRunner310(NPUModelRunner):
             ),
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
         )
+        self._acl_format = ACL_FORMAT_FRACTAL_NZ
         self.sampler = AscendSampler310()
         if getattr(self, "rejection_sampler", None) is not None:
             self.rejection_sampler = RejectionSampler(self.sampler)
@@ -314,12 +316,12 @@ class NPUModelRunner310(NPUModelRunner):
                     k_shape = kv_cache_shape[1:]
                     v_shape = k_shape
                     dtype = kv_cache_spec.dtype
-                    # 310P reshape_and_cache expects KV cache to be ND format
-                    # with an NZ-shaped logical view, not a true FRACTAL_NZ
-                    # tensor. Allocating the cache with empty_with_format causes
-                    # ATB setup to reject some shapes during cache writes.
-                    k_cache = torch.empty(k_shape, dtype=dtype, device=self.device)
-                    v_cache = torch.empty(v_shape, dtype=dtype, device=self.device)
+                    k_cache = torch_npu.empty_with_format(
+                        size=k_shape, dtype=dtype, device=self.device, acl_format=self._acl_format
+                    )
+                    v_cache = torch_npu.empty_with_format(
+                        size=v_shape, dtype=dtype, device=self.device, acl_format=self._acl_format
+                    )
                     for layer_name_inner in kv_cache_tensor.shared_by:
                         # shared the kvcache between the self_attn specs in the same group
                         if "attn" in layer_name_inner and "linear_attn" not in layer_name_inner:

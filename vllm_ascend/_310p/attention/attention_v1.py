@@ -18,7 +18,6 @@
 from typing import Any
 
 import torch_npu
-from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.registry import (  # type: ignore
     AttentionBackendEnum,
     register_backend,
@@ -68,11 +67,14 @@ class AscendAttentionBackend310(AscendAttentionBackend):
             tuple: The specific 5D shape required by the hardware
                    (2, num_blocks, hidden_dim_aligned, block_size, 16).
         """
-        # The paged-attention cache layout on 310P uses an NZ-shaped view while
-        # reshape_and_cache still writes into a regular ND tensor. Round the
-        # flattened hidden dimension up so odd KV shapes still fit the 16-wide
-        # tile requirement of the backend.
-        return (2, num_blocks, cdiv(num_kv_heads * head_size, 16), block_size, 16)
+        if block_size % 16 != 0:
+            raise ValueError(f"310P reshape_and_cache requires block_size aligned to 16, got {block_size}.")
+        # Atlas inference products only support float16 on 310P. The ATB
+        # ReshapeAndCache spec requires head_size to be 32-byte aligned, which
+        # means 16 elements for fp16/bf16.
+        if head_size % 16 != 0:
+            raise ValueError(f"310P reshape_and_cache requires head_size aligned to 16, got {head_size}.")
+        return (2, num_blocks, num_kv_heads * head_size // 16, block_size, 16)
 
     @staticmethod
     def get_impl_cls():

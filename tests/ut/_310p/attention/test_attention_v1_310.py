@@ -39,8 +39,15 @@ class TestAscendAttentionBackend310(TestBase):
         self.assertEqual(AscendAttentionBackend310.get_builder_cls(), AscendAttentionMetadataBuilder310)
 
     def test_get_kv_cache_shape_not(self):
-        result = AscendAttentionBackend310.get_kv_cache_shape(10, 20, 30, 40)
-        self.assertEqual(result, (2, 10, 75, 20, 16))
+        result = AscendAttentionBackend310.get_kv_cache_shape(10, 64, 8, 256)
+        self.assertEqual(result, (2, 10, 128, 64, 16))
+
+    def test_get_kv_cache_shape_invalid_alignment(self):
+        with self.assertRaises(ValueError):
+            AscendAttentionBackend310.get_kv_cache_shape(10, 20, 8, 256)
+
+        with self.assertRaises(ValueError):
+            AscendAttentionBackend310.get_kv_cache_shape(10, 64, 8, 40)
 
 
 class TestAscendAttentionBackendImpl310(TestBase):
