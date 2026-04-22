@@ -36,6 +36,7 @@ from vllm.model_executor.layers.linear import (  # noqa
     RowParallelLinear,
     UnquantizedLinearMethod,
 )
+from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.utils import set_weight_attrs
 
@@ -487,3 +488,7 @@ class AscendReplicatedLinear(ReplicatedLinear):
             return self.custom_op.apply(input_)
 
         return super().forward(input_)
+
+
+class AscendGateLinear(GateLinear, AscendReplicatedLinear):
+    """Reuse GateLinear routing behavior with Ascend replicated linear backend."""
