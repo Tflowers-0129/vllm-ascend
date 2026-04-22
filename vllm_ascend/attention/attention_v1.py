@@ -771,16 +771,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
         key_bsh = key.view(batch_size, seq_kv, num_kv_heads * head_dim)
         value_bsh = value.view(batch_size, seq_kv, num_kv_heads * head_dim)
 
-        logger.info(
-            "[_forward_fia_fullattention] query=%s dtype=%s, key=%s dtype=%s, value=%s dtype=%s",
-            query_bsh.shape,
-            query_bsh.dtype,
-            key_bsh.shape,
-            key_bsh.dtype,
-            value_bsh.shape,
-            value_bsh.dtype,
-        )
-
         attn_output, _ = torch_npu.npu_fused_infer_attention_score(
             query_bsh,
             key_bsh,
