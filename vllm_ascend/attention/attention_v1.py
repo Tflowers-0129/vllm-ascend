@@ -755,34 +755,47 @@ class AscendAttentionBackendImpl(AttentionImpl):
             actual_seq_lengths_kv = attn_metadata.seq_lens_list
         return key, value, block_size, block_table, actual_seq_lengths_kv
 
-    def _gather_paged_kv_to_dense(
+    def _forward_fia_fullattention(
         self,
+        query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        block_table: torch.Tensor,
-        seq_lens: list[int],
-    ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
-        """Gather paged KV ([num_block, block_size, H]) to dense TND KV."""
-        batch_size = block_table.shape[0]
-        block_size = key.shape[1]
-        hidden = key.shape[2]
-        max_blocks_per_seq = block_table.shape[1]
-        max_tokens_padded = max_blocks_per_seq * block_size
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor,
+    ):
+        batch_size = 1
+        seq_q, num_q_heads, head_dim = query.shape
+        seq_kv, num_kv_heads, _ = key.shape
 
-        flat_ids = block_table.reshape(-1)
-        gathered_k = key[flat_ids].view(batch_size, max_tokens_padded, hidden)
-        gathered_v = value[flat_ids].view(batch_size, max_tokens_padded, hidden)
+        query_bsh = query.view(batch_size, seq_q, num_q_heads * head_dim)
+        key_bsh = key.view(batch_size, seq_kv, num_kv_heads * head_dim)
+        value_bsh = value.view(batch_size, seq_kv, num_kv_heads * head_dim)
 
-        seq_lens_t = torch.as_tensor(seq_lens, dtype=torch.long, device=key.device)
-        positions = torch.arange(max_tokens_padded, dtype=torch.long, device=key.device)
-        valid_mask = (positions.unsqueeze(0) < seq_lens_t.unsqueeze(1)).reshape(-1)
+        logger.info(
+            "[_forward_fia_fullattention] query=%s dtype=%s, key=%s dtype=%s, value=%s dtype=%s",
+            query_bsh.shape,
+            query_bsh.dtype,
+            key_bsh.shape,
+            key_bsh.dtype,
+            value_bsh.shape,
+            value_bsh.dtype,
+        )
 
-        dense_k = gathered_k.reshape(-1, hidden)[valid_mask]
-        dense_v = gathered_v.reshape(-1, hidden)[valid_mask]
-        dense_k = dense_k.view(-1, self.num_kv_heads, self.head_size)
-        dense_v = dense_v.view(-1, self.num_kv_heads, self.head_size)
-        seq_lens_cum = torch.cumsum(seq_lens_t.to(torch.int32), dim=0).tolist()
-        return dense_k, dense_v, seq_lens_cum
+        attn_output, _ = torch_npu.npu_fused_infer_attention_score(
+            query_bsh,
+            key_bsh,
+            value_bsh,
+            num_heads=self.num_heads,
+            num_key_value_heads=self.num_kv_heads,
+            input_layout="BSH",
+            atten_mask=attn_metadata.attn_mask,
+            scale=self.scale,
+            sparse_mode=3,
+        )
+
+        attn_output = attn_output.view(seq_q, self.num_heads, self.head_size)
+        output[:seq_q] = attn_output[:seq_q]
+        return output
 
     def _forward_fia_slidingwindow(self, query: torch.Tensor, attn_metadata: AscendMetadata, output: torch.Tensor):
         batch_size = attn_metadata.seq_lens.shape[0]
@@ -848,32 +861,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
         ):
             key = key[:num_tokens]
             value = value[:num_tokens]
-        # FIA V1 has strict shape limits for large head dim (e.g. Gemma4 full-attn
-        # head_size=512). In non-decode stages we fallback to FA with dense KV.
         if (
-            self.head_size >= 512
-            and attn_metadata.attn_state != AscendAttentionState.DecodeOnly
+            attn_metadata.attn_state == AscendAttentionState.PrefillNoCache
+            and self.attn_type != AttentionType.ENCODER_DECODER
+            and self.sliding_window is None
             and self.sinks is None
         ):
-            if block_table is not None:
-                assert isinstance(actual_seq_lengths_kv, list)
-                key, value, actual_seq_lengths_kv = self._gather_paged_kv_to_dense(
-                    key, value, block_table, actual_seq_lengths_kv
-                )
-            attn_output = torch_npu.npu_fusion_attention(
-                query=query,
-                key=key,
-                value=value,
-                head_num=self.num_heads,
-                input_layout="TND",
-                scale=self.scale,
-                atten_mask=attn_metadata.attn_mask,
-                sparse_mode=3,
-                actual_seq_qlen=attn_metadata.actual_seq_lengths_q,
-                actual_seq_kvlen=actual_seq_lengths_kv,
-            )[0]
-            output[:num_tokens] = attn_output[:num_tokens]
-            return output
+            return self._forward_fia_fullattention(query, key, value, attn_metadata, output)
         # Get workspace from cache or calculate it if not present.
         if self.sinks is not None:
             actual_seq_qlen = attn_metadata.actual_seq_lengths_q
