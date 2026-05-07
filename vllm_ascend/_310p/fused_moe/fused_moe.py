@@ -15,21 +15,40 @@
 # limitations under the License.
 #
 from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import Any
 
 import torch
+import torch.nn.functional as F
 from vllm.distributed import get_dp_group, get_ep_group, get_tp_group
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.layer import FusedMoE, UnquantizedFusedMoEMethod
 from vllm.model_executor.layers.fused_moe.shared_fused_moe import SharedFusedMoE
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.ops.fused_moe.experts_selector import zero_experts_compute
 from vllm_ascend.ops.fused_moe.moe_comm_method import FusedExpertsResult, _MoECommMethods
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
 from vllm_ascend.quantization.quant_type import QuantType
+from vllm_ascend.utils import npu_stream_switch, shared_experts_calculation_stream
 
 from .experts_selector import select_experts
 from .moe_comm_method import AllGatherCommImpl310
+
+
+@dataclass
+class FusedMoEResult310:
+    routed_out: torch.Tensor
+    before_dispatch_evt: Any | None = None
+    before_combine_evt: Any | None = None
+
+
+@dataclass
+class FusedMoEEvents310:
+    before_routed_experts: Any
+    before_dispatch: Any | None = field(default=None)
+    before_combine: Any | None = field(default=None)
 
 
 class AscendUnquantizedFusedMoEMethod310(UnquantizedFusedMoEMethod):
@@ -220,8 +239,8 @@ class AscendFusedMoE310(FusedMoE):
         return quant_type
 
     def forward_impl(  # type: ignore[override]
-        self, hidden_states: torch.Tensor, router_logits: torch.Tensor
-    ) -> torch.Tensor:
+        self, hidden_states: torch.Tensor, router_logits: torch.Tensor, return_with_event: bool = False
+    ) -> torch.Tensor | FusedMoEResult310:
         assert self.quant_method is not None
         assert self.routed_scaling_factor == 1.0, "routed_scaling_factor != 1.0 is not supported."
 
@@ -258,6 +277,12 @@ class AscendFusedMoE310(FusedMoE):
             padded_hidden_states_shape=padded_hidden_states_shape,
         )
 
+        if return_with_event:
+            return FusedMoEResult310(
+                routed_out=routed_out,
+                before_dispatch_evt=fused_experts_results.before_dispatch_evt,
+                before_combine_evt=fused_experts_results.before_combine_evt,
+            )
         return routed_out
 
 
@@ -270,11 +295,17 @@ class AscendSharedFusedMoE310(SharedFusedMoE, AscendFusedMoE310):
         routed_input_transform: torch.nn.Module | None = None,
         **kwargs,
     ):
+        ascend_config = get_ascend_config()
         AscendFusedMoE310.__init__(self, **kwargs)
         self._routed_input_transform = routed_input_transform
         self._shared_experts = shared_experts
         self.use_overlapped = use_overlapped
         self.shared_expert_stream = None
+        self.multistream_overlap_shared_expert = (
+            ascend_config.multistream_overlap_shared_expert and shared_experts is not None
+        )
+        if self.multistream_overlap_shared_expert:
+            self.shared_expert_stream = shared_experts_calculation_stream()
         self._gate = gate
         # Recreate runner after shared_experts/gate are set so custom op dispatch
         # goes through moe_forward_shared.
@@ -316,20 +347,86 @@ class AscendSharedFusedMoE310(SharedFusedMoE, AscendFusedMoE310):
             return None, result
         return result
 
-    def _forward_shared_experts(self, hidden_states: torch.Tensor):
+    def _supports_split_shared_experts(self) -> bool:
+        return (
+            self._shared_experts is not None
+            and hasattr(self._shared_experts, "gate_up_proj")
+            and hasattr(self._shared_experts, "act_fn")
+            and hasattr(self._shared_experts, "down_proj")
+        )
+
+    def _shared_experts_part1(self, hidden_states: torch.Tensor):
+        shared_gate_up, _ = self._shared_experts.gate_up_proj(hidden_states)  # type: ignore
+        return shared_gate_up
+
+    def _shared_experts_part2(self, hidden_states: torch.Tensor, shared_gate_up: torch.Tensor):
+        shared_act = self._shared_experts.act_fn(shared_gate_up)  # type: ignore
+        shared_out, _ = self._shared_experts.down_proj(shared_act)  # type: ignore
+
+        if hasattr(self._shared_experts, "expert_gate") and self._shared_experts.expert_gate is not None:
+            gate_out, _ = self._shared_experts.expert_gate(hidden_states)  # type: ignore
+            shared_out = F.sigmoid(gate_out) * shared_out
+        return shared_out
+
+    def _forward_shared_experts(self, hidden_states: torch.Tensor, fused_moe_evts: FusedMoEEvents310 | None = None):
         if self._shared_experts is None:
             return None
-        return self._shared_experts(hidden_states)
+        if (
+            not getattr(self, "multistream_overlap_shared_expert", False)
+            or fused_moe_evts is None
+            or not self._supports_split_shared_experts()
+        ):
+            return self._shared_experts(hidden_states)
+
+        def maybe_wait_event(evt: Any | None):
+            if evt is not None:
+                torch.npu.current_stream().wait_event(evt)
+
+        shared_expert_stream = getattr(self, "shared_expert_stream", None) or shared_experts_calculation_stream()
+        with npu_stream_switch(shared_expert_stream):
+            torch.npu.current_stream().wait_event(fused_moe_evts.before_routed_experts)
+            maybe_wait_event(fused_moe_evts.before_dispatch)
+            part1_out = self._shared_experts_part1(hidden_states)
+            maybe_wait_event(fused_moe_evts.before_combine)
+            shared_out = self._shared_experts_part2(hidden_states, part1_out)
+
+        torch.npu.current_stream().wait_stream(shared_expert_stream)
+        return shared_out
 
     def forward_impl(  # type: ignore[override]
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor
     ):
-        routed_out = AscendFusedMoE310.forward_impl(
-            self,
-            hidden_states=hidden_states,
-            router_logits=router_logits,
+        overlap_shared_expert = (
+            getattr(self, "multistream_overlap_shared_expert", False) and self._supports_split_shared_experts()
         )
+        if overlap_shared_expert:
+            before_routed_experts = torch.npu.current_stream().record_event()
+            fused_moe_results = AscendFusedMoE310.forward_impl(
+                self,
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                return_with_event=True,
+            )
+            assert isinstance(fused_moe_results, FusedMoEResult310)
+            routed_out = fused_moe_results.routed_out
+        else:
+            routed_out = AscendFusedMoE310.forward_impl(
+                self,
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+            )
+
         if self._shared_experts is None:
             return routed_out
-        shared_out = self._forward_shared_experts(hidden_states)
+        if overlap_shared_expert:
+            shared_out = self._forward_shared_experts(
+                hidden_states,
+                FusedMoEEvents310(
+                    before_routed_experts=before_routed_experts,
+                    before_dispatch=fused_moe_results.before_dispatch_evt,
+                    before_combine=fused_moe_results.before_combine_evt,
+                ),
+            )
+        else:
+            shared_out = self._forward_shared_experts(hidden_states)
         return shared_out, routed_out

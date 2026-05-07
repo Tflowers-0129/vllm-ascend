@@ -13,14 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import patch
+from contextlib import nullcontext
+from unittest.mock import MagicMock, patch
 
 import torch
 import torch.nn.functional as F
 
+import vllm_ascend._310p.fused_moe.fused_moe as fused_moe_310
 from vllm_ascend._310p.fused_moe.fused_moe import (
     AscendFusedMoE310,
     AscendSharedFusedMoE310,
+    FusedMoEResult310,
 )
 
 
@@ -46,6 +49,30 @@ class _DummySharedExperts(torch.nn.Module):
             gate_out, _ = self.expert_gate(hidden_states)
             out = F.sigmoid(gate_out) * out
         return out
+
+
+class _TupleLinear(torch.nn.Module):
+    def __init__(self, scale: float, bias: float = 0.0):
+        super().__init__()
+        self.scale = scale
+        self.bias = bias
+
+    def forward(self, hidden_states: torch.Tensor):
+        return hidden_states * self.scale + self.bias, None
+
+
+class _SplitSharedExperts(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.gate_up_proj = _TupleLinear(2.0, 1.0)
+        self.act_fn = torch.nn.Identity()
+        self.down_proj = _TupleLinear(3.0)
+        self.expert_gate = None
+
+    def forward(self, hidden_states: torch.Tensor):
+        shared_gate_up, _ = self.gate_up_proj(hidden_states)
+        shared_out, _ = self.down_proj(self.act_fn(shared_gate_up))
+        return shared_out
 
 
 def _build_layer(shared_experts: torch.nn.Module | None) -> AscendSharedFusedMoE310:
@@ -103,6 +130,48 @@ def test_forward_impl_without_shared_experts_returns_routed_only_310():
         output = layer.forward_impl(hidden_states, router_logits)
 
     torch.testing.assert_close(output, routed_out)
+
+
+def test_forward_impl_with_multistream_shared_experts_uses_event_result_310():
+    layer = _build_layer(_SplitSharedExperts())
+    layer.multistream_overlap_shared_expert = True
+    layer.shared_expert_stream = MagicMock()
+    hidden_states = torch.randn(3, 8)
+    router_logits = torch.randn(3, 8)
+    routed_out = torch.randn(3, 8)
+    before_dispatch_evt = MagicMock()
+    before_combine_evt = MagicMock()
+    current_stream = MagicMock()
+    before_routed_evt = MagicMock()
+    current_stream.record_event.return_value = before_routed_evt
+
+    with (
+        patch.object(
+            AscendFusedMoE310,
+            "forward_impl",
+            return_value=FusedMoEResult310(
+                routed_out=routed_out,
+                before_dispatch_evt=before_dispatch_evt,
+                before_combine_evt=before_combine_evt,
+            ),
+        ) as routed_forward,
+        patch.object(fused_moe_310.torch.npu, "current_stream", return_value=current_stream),
+        patch.object(fused_moe_310, "npu_stream_switch", return_value=nullcontext()),
+    ):
+        shared_out, routed = layer.forward_impl(hidden_states, router_logits)
+
+    routed_forward.assert_called_once_with(
+        layer,
+        hidden_states=hidden_states,
+        router_logits=router_logits,
+        return_with_event=True,
+    )
+    current_stream.wait_event.assert_any_call(before_routed_evt)
+    current_stream.wait_event.assert_any_call(before_dispatch_evt)
+    current_stream.wait_event.assert_any_call(before_combine_evt)
+    current_stream.wait_stream.assert_called_once_with(layer.shared_expert_stream)
+    torch.testing.assert_close(shared_out, layer._shared_experts(hidden_states))
+    torch.testing.assert_close(routed, routed_out)
 
 
 def test_is_internal_router_is_false_310():
