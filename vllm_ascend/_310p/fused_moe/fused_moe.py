@@ -324,6 +324,47 @@ class AscendSharedFusedMoE310(SharedFusedMoE, AscendFusedMoE310):
             shared_out = F.sigmoid(gate_out) * shared_out
         return shared_out
 
+    def _get_shared_expert_stream(self):
+        shared_expert_stream = getattr(self, "shared_expert_stream", None)
+        if shared_expert_stream is None:
+            shared_expert_stream = shared_experts_calculation_stream()
+            self.shared_expert_stream = shared_expert_stream
+        return shared_expert_stream
+
+    @staticmethod
+    def _record_shared_stream(tensor: torch.Tensor, stream: Any) -> None:
+        if tensor.device.type != "npu":
+            return
+        tensor.record_stream(stream)
+
+    @staticmethod
+    def _wait_event_on_stream(stream: Any, evt: Any | None) -> None:
+        if evt is not None:
+            stream.wait_event(evt)
+
+    def _start_shared_experts_part1(self, hidden_states: torch.Tensor, before_routed_experts: Any):
+        shared_expert_stream = self._get_shared_expert_stream()
+        self._wait_event_on_stream(shared_expert_stream, before_routed_experts)
+        self._record_shared_stream(hidden_states, shared_expert_stream)
+        with npu_stream_switch(shared_expert_stream):
+            return self._shared_experts_part1(hidden_states)
+
+    def _finish_shared_experts_part2(
+        self,
+        hidden_states: torch.Tensor,
+        shared_gate_up: torch.Tensor,
+        before_combine: Any | None,
+    ):
+        shared_expert_stream = self._get_shared_expert_stream()
+        self._wait_event_on_stream(shared_expert_stream, before_combine)
+        self._record_shared_stream(hidden_states, shared_expert_stream)
+        self._record_shared_stream(shared_gate_up, shared_expert_stream)
+        with npu_stream_switch(shared_expert_stream):
+            shared_out = self._shared_experts_part2(hidden_states, shared_gate_up)
+
+        torch.npu.current_stream().wait_stream(shared_expert_stream)
+        return shared_out
+
     def _forward_shared_experts(self, hidden_states: torch.Tensor, fused_moe_evts: FusedMoEEvents310 | None = None):
         if self._shared_experts is None:
             return None
@@ -334,30 +375,37 @@ class AscendSharedFusedMoE310(SharedFusedMoE, AscendFusedMoE310):
             return self._shared_experts(hidden_states)
         self._require_split_shared_experts()
 
-        def maybe_wait_event(evt: Any | None):
-            if evt is not None:
-                torch.npu.current_stream().wait_event(evt)
-
-        shared_expert_stream = getattr(self, "shared_expert_stream", None) or shared_experts_calculation_stream()
-        with npu_stream_switch(shared_expert_stream):
-            torch.npu.current_stream().wait_event(fused_moe_evts.before_routed_experts)
-            maybe_wait_event(fused_moe_evts.before_dispatch)
-            part1_out = self._shared_experts_part1(hidden_states)
-            maybe_wait_event(fused_moe_evts.before_combine)
-            shared_out = self._shared_experts_part2(hidden_states, part1_out)
-
-        torch.npu.current_stream().wait_stream(shared_expert_stream)
-        return shared_out
+        part1_out = self._start_shared_experts_part1(
+            hidden_states,
+            fused_moe_evts.before_routed_experts,
+        )
+        return self._finish_shared_experts_part2(
+            hidden_states,
+            part1_out,
+            fused_moe_evts.before_combine,
+        )
 
     def forward_impl(  # type: ignore[override]
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor
     ):
-        overlap_shared_expert = getattr(self, "multistream_overlap_shared_expert", False)
+        overlap_shared_expert = (
+            getattr(self, "multistream_overlap_shared_expert", False)
+            and self._shared_experts is not None
+        )
         if overlap_shared_expert:
             self._require_split_shared_experts()
 
         if overlap_shared_expert:
             before_routed_experts = torch.npu.current_stream().record_event()
+            # On 310P, submitting the shared expert work only after the routed
+            # expert path is fully enqueued makes the NPU runtime execute them
+            # serially in practice. Put the first shared matmul on the shared
+            # stream before enqueuing routed experts, then finish after the
+            # routed path reaches combine.
+            shared_gate_up = self._start_shared_experts_part1(
+                hidden_states,
+                before_routed_experts,
+            )
             fused_moe_results = AscendFusedMoE310.forward_impl(
                 self,
                 hidden_states=hidden_states,
@@ -376,13 +424,10 @@ class AscendSharedFusedMoE310(SharedFusedMoE, AscendFusedMoE310):
         if self._shared_experts is None:
             return routed_out
         if overlap_shared_expert:
-            shared_out = self._forward_shared_experts(
+            shared_out = self._finish_shared_experts_part2(
                 hidden_states,
-                FusedMoEEvents310(
-                    before_routed_experts=before_routed_experts,
-                    before_dispatch=fused_moe_results.before_dispatch_evt,
-                    before_combine=fused_moe_results.before_combine_evt,
-                ),
+                shared_gate_up,
+                fused_moe_results.before_combine_evt,
             )
         else:
             shared_out = self._forward_shared_experts(hidden_states)

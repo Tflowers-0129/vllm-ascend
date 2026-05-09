@@ -148,6 +148,27 @@ class TestACLGraphWrapper(TestBase):
         self.assertEqual(wrapper.aclgraph_options, self.mock_cudagraph_options)
         self.assertEqual(wrapper.concrete_aclgraph_entries, {})
 
+    @patch('vllm_ascend.compilation.acl_graph.should_bypass_aclgraph_for_multistream_shared_experts',
+           return_value=True)
+    @patch('vllm_ascend.compilation.acl_graph.current_platform')
+    @patch('vllm_ascend.compilation.acl_graph.envs')
+    def test_call_bypasses_aclgraph_for_multistream_shared_experts(
+            self, mock_envs, mock_current_platform, mock_should_bypass):
+        """Test ACLGraphWrapper bypasses replay/capture when stream scheduling is required"""
+        mock_envs.VLLM_LOGGING_LEVEL = "INFO"
+        mock_current_platform.get_global_graph_pool.return_value = self.mock_graph_pool
+
+        wrapper = ACLGraphWrapper(runnable=self.mock_runnable,
+                                  vllm_config=self.mock_vllm_config,
+                                  runtime_mode=CUDAGraphMode.FULL,
+                                  cudagraph_options=self.mock_cudagraph_options)
+
+        output = wrapper("arg", key="value")
+
+        self.assertEqual(output, "test_output")
+        self.mock_runnable.assert_called_once_with("arg", key="value")
+        self.assertEqual(wrapper.concrete_aclgraph_entries, {})
+
     @patch('vllm_ascend.compilation.acl_graph.current_platform')
     @patch('vllm_ascend.compilation.acl_graph.envs')
     def test_initialization_assertion_error(self, mock_envs,

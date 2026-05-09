@@ -97,6 +97,7 @@ from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, using_pag
 # yapf: disable
 from vllm_ascend.compilation.acl_graph import (
     ACLGraphWrapper,
+    should_bypass_aclgraph_for_multistream_shared_experts,
     set_draft_graph_params,
     set_graph_params,
     update_full_graph_params,
@@ -1214,6 +1215,9 @@ class NPUModelRunner(GPUModelRunner):
                 num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
                 if self.pcp_size > 1:
                     num_tokens_unpadded = self.pcp_manager.total_num_sampled_tokens_pcp
+                bypass_aclgraph_for_shared_expert_overlap = (
+                    should_bypass_aclgraph_for_multistream_shared_experts()
+                )
                 cascade_attn_prefix_lens = None
                 # Disable cascade attention when using microbatching (DBO)
                 if self.cascade_attn_enabled and not self.parallel_config.enable_dbo:
@@ -1236,7 +1240,10 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     max_num_scheduled_tokens=max_num_scheduled_tokens,
                     use_cascade_attn=cascade_attn_prefix_lens is not None,
-                    force_eager=self.model_config.enforce_eager,
+                    force_eager=(
+                        self.model_config.enforce_eager
+                        or bypass_aclgraph_for_shared_expert_overlap
+                    ),
                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
                 )
 
@@ -1343,6 +1350,9 @@ class NPUModelRunner(GPUModelRunner):
             cudagraph_mode = CUDAGraphMode.NONE
             # Mark KV scales as calculated after the first forward pass
             self.calculate_kv_scales = False  # type: ignore[has-type]
+        bypass_aclgraph_for_shared_expert_overlap = should_bypass_aclgraph_for_multistream_shared_experts()
+        if bypass_aclgraph_for_shared_expert_overlap:
+            cudagraph_mode = CUDAGraphMode.NONE
         # prevent debugger is None
         if self.debugger is not None:
             dbg_cfg = getattr(self.debugger, "config", None)
@@ -1377,7 +1387,7 @@ class NPUModelRunner(GPUModelRunner):
                 num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
                 model_instance=self.model,
                 max_tokens_across_pcp=0 if self.pcp_size == 1 else self.pcp_manager.max_num_tokens_across_pcp,
-                skip_compiled=has_encoder_input,
+                skip_compiled=has_encoder_input or bypass_aclgraph_for_shared_expert_overlap,
             ),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
@@ -2594,7 +2604,13 @@ class NPUModelRunner(GPUModelRunner):
         # wrap the model with full graph wrapper if needed.
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             self.update_stream: torch.npu.Stream = torch.npu.Stream()
-            self.model = ACLGraphWrapper(self.model, self.vllm_config, runtime_mode=CUDAGraphMode.FULL)
+            if should_bypass_aclgraph_for_multistream_shared_experts():
+                logger.warning_once(
+                    "Skipping ACLGraph wrapping because 310P multistream shared expert overlap "
+                    "requires eager stream scheduling."
+                )
+            else:
+                self.model = ACLGraphWrapper(self.model, self.vllm_config, runtime_mode=CUDAGraphMode.FULL)
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """

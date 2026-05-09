@@ -21,6 +21,7 @@ import numpy as np
 import torch
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.logger import logger
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
@@ -33,6 +34,7 @@ from vllm.v1.worker.gpu.input_batch import (
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.compilation.acl_graph import should_bypass_aclgraph_for_multistream_shared_experts
 from vllm_ascend.utils import set_weight_prefetch_method
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
@@ -60,10 +62,18 @@ class NPUModelRunner(GPUModelRunner):
         del self.speculator
 
         # NPU specific initializations can be added below.
+        cudagraph_mode = self.compilation_config.cudagraph_mode
+        if should_bypass_aclgraph_for_multistream_shared_experts():
+            logger.warning_once(
+                "Disabling ACLGraph because 310P multistream shared expert overlap "
+                "requires eager stream scheduling."
+            )
+            cudagraph_mode = CUDAGraphMode.NONE
+
         self.cudagraph_manager: ModelAclGraphManager = ModelAclGraphManager(
             self.vllm_config,
             self.device,
-            self.compilation_config.cudagraph_mode,
+            cudagraph_mode,
             decode_query_len=self.decode_query_len,
             model_runner=self,
         )
@@ -123,7 +133,7 @@ class NPUModelRunner(GPUModelRunner):
 
         # we need to update full graph params in run_fullgraph,
         # so create a stream to update full graph params.
-        if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
+        if cudagraph_mode.has_full_cudagraphs():
             self.update_stream: torch.npu.Stream = torch.npu.Stream()
 
         # we need to use return value of `get_cudagraph_and_dp_padding`

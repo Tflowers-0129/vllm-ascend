@@ -20,8 +20,16 @@ from vllm.logger import logger
 from vllm.platforms import current_platform
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.ascend_config import get_ascend_config
 
-from ..utils import weak_ref_tensors
+from ..utils import is_310p, weak_ref_tensors
+
+
+def should_bypass_aclgraph_for_multistream_shared_experts() -> bool:
+    try:
+        return is_310p() and get_ascend_config().multistream_overlap_shared_expert
+    except RuntimeError:
+        return False
 
 
 @dataclasses.dataclass
@@ -103,6 +111,13 @@ class ACLGraphWrapper:
         return self.runnable
 
     def __call__(self, *args, **kwargs):
+        if should_bypass_aclgraph_for_multistream_shared_experts():
+            logger.warning_once(
+                "Bypassing ACLGraph because 310P multistream shared expert overlap "
+                "requires eager stream scheduling."
+            )
+            return self.runnable(*args, **kwargs)
+
         forward_context = get_forward_context()
         batch_descriptor = forward_context.batch_descriptor
         aclgraph_runtime_mode = forward_context.cudagraph_runtime_mode

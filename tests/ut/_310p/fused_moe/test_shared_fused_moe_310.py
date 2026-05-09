@@ -145,17 +145,35 @@ def test_forward_impl_with_multistream_shared_experts_uses_event_result_310():
     current_stream = MagicMock()
     before_routed_evt = MagicMock()
     current_stream.record_event.return_value = before_routed_evt
+    call_order = []
+
+    original_part1 = layer._shared_experts_part1
+    original_part2 = layer._shared_experts_part2
+
+    def tracked_part1(hidden_states):
+        call_order.append("shared_part1")
+        return original_part1(hidden_states)
+
+    def tracked_part2(hidden_states, shared_gate_up):
+        call_order.append("shared_part2")
+        return original_part2(hidden_states, shared_gate_up)
+
+    def routed_forward(*args, **kwargs):
+        call_order.append("routed")
+        return FusedMoEResult310(
+            routed_out=routed_out,
+            before_dispatch_evt=before_dispatch_evt,
+            before_combine_evt=before_combine_evt,
+        )
 
     with (
         patch.object(
             AscendFusedMoE310,
             "forward_impl",
-            return_value=FusedMoEResult310(
-                routed_out=routed_out,
-                before_dispatch_evt=before_dispatch_evt,
-                before_combine_evt=before_combine_evt,
-            ),
+            side_effect=routed_forward,
         ) as routed_forward,
+        patch.object(layer, "_shared_experts_part1", side_effect=tracked_part1),
+        patch.object(layer, "_shared_experts_part2", side_effect=tracked_part2),
         patch.object(fused_moe_310.torch.npu, "current_stream", return_value=current_stream),
         patch.object(fused_moe_310, "npu_stream_switch", return_value=nullcontext()),
     ):
@@ -167,9 +185,9 @@ def test_forward_impl_with_multistream_shared_experts_uses_event_result_310():
         router_logits=router_logits,
         return_with_event=True,
     )
-    current_stream.wait_event.assert_any_call(before_routed_evt)
-    current_stream.wait_event.assert_any_call(before_dispatch_evt)
-    current_stream.wait_event.assert_any_call(before_combine_evt)
+    assert call_order == ["shared_part1", "routed", "shared_part2"]
+    layer.shared_expert_stream.wait_event.assert_any_call(before_routed_evt)
+    layer.shared_expert_stream.wait_event.assert_any_call(before_combine_evt)
     current_stream.wait_stream.assert_called_once_with(layer.shared_expert_stream)
     torch.testing.assert_close(shared_out, layer._shared_experts(hidden_states))
     torch.testing.assert_close(routed, routed_out)
