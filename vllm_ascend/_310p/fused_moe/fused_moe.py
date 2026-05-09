@@ -300,13 +300,16 @@ class AscendSharedFusedMoE310(SharedFusedMoE, AscendFusedMoE310):
         )
         return shared_out, fused_out
 
-    def _supports_split_shared_experts(self) -> bool:
-        return (
-            self._shared_experts is not None
-            and hasattr(self._shared_experts, "gate_up_proj")
-            and hasattr(self._shared_experts, "act_fn")
-            and hasattr(self._shared_experts, "down_proj")
-        )
+    def _require_split_shared_experts(self) -> None:
+        if self._shared_experts is None:
+            return
+        required_attrs = ("gate_up_proj", "act_fn", "down_proj")
+        missing_attrs = [attr for attr in required_attrs if not hasattr(self._shared_experts, attr)]
+        if missing_attrs:
+            raise RuntimeError(
+                "multistream_overlap_shared_expert requires shared_experts to expose "
+                f"{required_attrs}, but {type(self._shared_experts).__name__} is missing {missing_attrs}."
+            )
 
     def _shared_experts_part1(self, hidden_states: torch.Tensor):
         shared_gate_up, _ = self._shared_experts.gate_up_proj(hidden_states)  # type: ignore
@@ -327,9 +330,9 @@ class AscendSharedFusedMoE310(SharedFusedMoE, AscendFusedMoE310):
         if (
             not getattr(self, "multistream_overlap_shared_expert", False)
             or fused_moe_evts is None
-            or not self._supports_split_shared_experts()
         ):
             return self._shared_experts(hidden_states)
+        self._require_split_shared_experts()
 
         def maybe_wait_event(evt: Any | None):
             if evt is not None:
@@ -349,9 +352,10 @@ class AscendSharedFusedMoE310(SharedFusedMoE, AscendFusedMoE310):
     def forward_impl(  # type: ignore[override]
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor
     ):
-        overlap_shared_expert = (
-            getattr(self, "multistream_overlap_shared_expert", False) and self._supports_split_shared_experts()
-        )
+        overlap_shared_expert = getattr(self, "multistream_overlap_shared_expert", False)
+        if overlap_shared_expert:
+            self._require_split_shared_experts()
+
         if overlap_shared_expert:
             before_routed_experts = torch.npu.current_stream().record_event()
             fused_moe_results = AscendFusedMoE310.forward_impl(

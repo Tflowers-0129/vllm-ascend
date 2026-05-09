@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 import torch.nn.functional as F
+import pytest
 
 import vllm_ascend._310p.fused_moe.fused_moe as fused_moe_310
 from vllm_ascend._310p.fused_moe.fused_moe import (
@@ -172,6 +173,16 @@ def test_forward_impl_with_multistream_shared_experts_uses_event_result_310():
     current_stream.wait_stream.assert_called_once_with(layer.shared_expert_stream)
     torch.testing.assert_close(shared_out, layer._shared_experts(hidden_states))
     torch.testing.assert_close(routed, routed_out)
+
+
+def test_forward_impl_with_multistream_shared_experts_requires_split_modules_310():
+    layer = _build_layer(_DummySharedExperts(with_gate=True))
+    layer.multistream_overlap_shared_expert = True
+    hidden_states = torch.randn(3, 8)
+    router_logits = torch.randn(3, 8)
+
+    with pytest.raises(RuntimeError, match="requires shared_experts to expose"):
+        layer.forward_impl(hidden_states, router_logits)
 
 
 def test_is_internal_router_is_false_310():
