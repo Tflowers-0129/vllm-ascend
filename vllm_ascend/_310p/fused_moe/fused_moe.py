@@ -20,7 +20,9 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+import torch_npu
 from vllm.distributed import get_dp_group, get_ep_group, get_tp_group
+from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.layer import FusedMoE, UnquantizedFusedMoEMethod
 from vllm.model_executor.layers.fused_moe.shared_fused_moe import SharedFusedMoE
@@ -31,7 +33,7 @@ from vllm_ascend.ops.fused_moe.experts_selector import zero_experts_compute
 from vllm_ascend.ops.fused_moe.moe_comm_method import FusedExpertsResult, _MoECommMethods
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
 from vllm_ascend.quantization.quant_type import QuantType
-from vllm_ascend.utils import maybe_trans_nz, npu_stream_switch, shared_experts_calculation_stream
+from vllm_ascend.utils import maybe_trans_nz, shared_experts_calculation_stream
 
 from .experts_selector import select_experts
 from .moe_comm_method import AllGatherCommImpl310
@@ -270,6 +272,11 @@ class AscendSharedFusedMoE310(SharedFusedMoE, AscendFusedMoE310):
         )
         if self.multistream_overlap_shared_expert:
             self.shared_expert_stream = shared_experts_calculation_stream()
+            logger.warning_once(
+                "310P SharedFusedMoE overlap enabled: shared_experts=%s shared_stream=%s.",
+                type(shared_experts).__name__,
+                str(self.shared_expert_stream),
+            )
         self._gate = gate
         # Recreate runner after shared_experts/gate are set so custom op dispatch
         # goes through moe_forward_shared.
@@ -342,11 +349,20 @@ class AscendSharedFusedMoE310(SharedFusedMoE, AscendFusedMoE310):
         if evt is not None:
             stream.wait_event(evt)
 
+    @staticmethod
+    def _shared_stream_context(stream: Any):
+        return torch_npu.npu.stream(stream)
+
     def _start_shared_experts_part1(self, hidden_states: torch.Tensor, before_routed_experts: Any):
         shared_expert_stream = self._get_shared_expert_stream()
         self._wait_event_on_stream(shared_expert_stream, before_routed_experts)
         self._record_shared_stream(hidden_states, shared_expert_stream)
-        with npu_stream_switch(shared_expert_stream):
+        logger.warning_once(
+            "310P SharedFusedMoE submits shared expert part1 on shared_stream=%s from current_stream=%s.",
+            str(shared_expert_stream),
+            str(torch_npu.npu.current_stream()),
+        )
+        with self._shared_stream_context(shared_expert_stream):
             return self._shared_experts_part1(hidden_states)
 
     def _finish_shared_experts_part2(
@@ -359,10 +375,10 @@ class AscendSharedFusedMoE310(SharedFusedMoE, AscendFusedMoE310):
         self._wait_event_on_stream(shared_expert_stream, before_combine)
         self._record_shared_stream(hidden_states, shared_expert_stream)
         self._record_shared_stream(shared_gate_up, shared_expert_stream)
-        with npu_stream_switch(shared_expert_stream):
+        with self._shared_stream_context(shared_expert_stream):
             shared_out = self._shared_experts_part2(hidden_states, shared_gate_up)
 
-        torch.npu.current_stream().wait_stream(shared_expert_stream)
+        torch_npu.npu.current_stream().wait_stream(shared_expert_stream)
         return shared_out
 
     def _forward_shared_experts(self, hidden_states: torch.Tensor, fused_moe_evts: FusedMoEEvents310 | None = None):
@@ -396,7 +412,7 @@ class AscendSharedFusedMoE310(SharedFusedMoE, AscendFusedMoE310):
             self._require_split_shared_experts()
 
         if overlap_shared_expert:
-            before_routed_experts = torch.npu.current_stream().record_event()
+            before_routed_experts = torch_npu.npu.current_stream().record_event()
             # On 310P, submitting the shared expert work only after the routed
             # expert path is fully enqueued makes the NPU runtime execute them
             # serially in practice. Put the first shared matmul on the shared

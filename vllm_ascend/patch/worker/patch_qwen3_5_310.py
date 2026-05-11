@@ -19,16 +19,31 @@
 
 import torch
 import torch.nn.functional as F
+import vllm.model_executor.layers.fused_moe as fused_moe_pkg
+import vllm.model_executor.layers.fused_moe.shared_fused_moe as shared_fused_moe_mod
+import vllm.model_executor.models.qwen3_next as qwen3_next_mod
 from vllm.forward_context import get_forward_context
+from vllm.logger import logger
 from vllm.model_executor.models.qwen3_5 import Qwen3_5GatedDeltaNet
 from vllm.v1.attention.backend import AttentionMetadata  # type: ignore
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
+from vllm_ascend._310p.fused_moe.fused_moe import AscendSharedFusedMoE310
 from vllm_ascend._310p.ops.fla.chunk_gated_delta_rule import chunk_gated_delta_rule_pytorch
 from vllm_ascend._310p.ops.fla.fused_gdn_gating import fused_gdn_gating_pytorch
 from vllm_ascend.attention.utils import maybe_save_kv_layer_to_connector
 from vllm_ascend.utils import enable_sp
+
+
+def _patch_qwen3_5_shared_fused_moe_310() -> None:
+    fused_moe_pkg.SharedFusedMoE = AscendSharedFusedMoE310
+    shared_fused_moe_mod.SharedFusedMoE = AscendSharedFusedMoE310
+    qwen3_next_mod.SharedFusedMoE = AscendSharedFusedMoE310
+    logger.warning_once("310P Qwen3.5 SharedFusedMoE is patched to AscendSharedFusedMoE310.")
+
+
+_patch_qwen3_5_shared_fused_moe_310()
 
 
 def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
