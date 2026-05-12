@@ -7,6 +7,7 @@ if [[ "$SOC_VERSION" =~ ^ascend310 ]]; then
     # ASCEND310P series
     CUSTOM_OPS_ARRAY=(
         "causal_conv1d_v310"
+        "chunk_gated_delta_rule_v310"
         "recurrent_gated_delta_rule_v310"
     )
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")

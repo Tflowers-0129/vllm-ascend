@@ -45,6 +45,7 @@
 #include "attention/sparse_flash_attention/sparse_flash_attention_torch_adpt.h"
 #include "attention/lightning_indexer_quant/lightning_indexer_quant_torch_adpt.h"
 #include "moe/causal_conv1d_v310/causal_conv1d_310_torch_adpt.h"
+#include "attention/chunk_gated_delta_rule_v310/chunk_gated_delta_rule_310_torch_adpt.h"
 #include "attention/recurrent_gated_delta_rule_v310/recurrent_gated_delta_rule_310_torch_adpt.h"
 #include <c10/core/Device.h>
 #include <c10/core/Scalar.h>
@@ -1006,6 +1007,14 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                         int pad_slot_id, "
         "                         int run_mode) -> (Tensor output)");
     ops.impl("npu_causal_conv1d_310", torch::kPrivateUse1, &vllm_ascend::npu_causal_conv1d_310);
+
+    ops.def(
+        "npu_chunk_gated_delta_rule_310(Tensor query, "
+        "                                   Tensor key, "
+        "                                   Tensor value, "
+        "                                   Tensor g, "
+        "                                   Tensor beta) -> (Tensor out, Tensor final_state)");
+    ops.impl("npu_chunk_gated_delta_rule_310", torch::kPrivateUse1, &vllm_ascend::npu_chunk_gated_delta_rule_310);
 
     ops.def(
         "npu_recurrent_gated_delta_rule_310(Tensor query, "
