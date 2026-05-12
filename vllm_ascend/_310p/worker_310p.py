@@ -21,6 +21,7 @@ from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import memory_profiling
 
 from vllm_ascend._310p.model_runner_310p import NPUModelRunner310
+from vllm_ascend.utils import get_available_memory, is_rc_device
 from vllm_ascend.worker.worker import NPUWorker, init_workspace_manager
 
 
@@ -72,6 +73,8 @@ class NPUWorker310(NPUWorker):
         ) as profile_result:
             self.model_runner.profile_run()
             free_memory, total_memory = torch.npu.mem_get_info()
+            if is_rc_device():
+                free_memory = get_available_memory()
             torch_memory = torch.npu.memory_reserved()
             non_torch_memory_before_empty_cache = total_memory - free_memory - torch_memory
 

@@ -22,6 +22,7 @@ from __future__ import annotations
 import functools
 import math
 import os
+import subprocess
 from contextlib import nullcontext
 from enum import Enum
 from functools import lru_cache
@@ -77,6 +78,19 @@ _CUSTOM_OP_BASE_DIR = (
 
 def is_310p():
     return get_ascend_device_type() == AscendDeviceType._310P
+
+
+def is_rc_device():
+    try:
+        result = subprocess.run(["lspci"], capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        logger.warning("lspci command not found; skip Root Complex device memory detection.")
+        return False
+    return result.returncode == 0 and not any("accelerators" in line.lower() for line in result.stdout.splitlines())
+
+
+def get_available_memory():
+    return int(subprocess.check_output(["free", "-b"]).splitlines()[1].split()[-1])
 
 
 def _mark_op_side_effectful(op: Any) -> None:
