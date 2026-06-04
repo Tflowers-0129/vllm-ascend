@@ -1516,6 +1516,32 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> chunk_gated_delta_rule_fwd_h_meta
     }
 }
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> chunk_gated_delta_rule_fwd_prepare_meta(
+    const at::Tensor & q,
+    const at::Tensor & k,
+    const at::Tensor & v,
+    const at::Tensor & g,
+    const at::Tensor & beta,
+    c10::optional<int64_t> chunk_size,
+    c10::optional<bool> use_qk_l2norm)
+{
+    auto B = q.size(0);
+    auto T = q.size(1);
+    auto Hq = q.size(2);
+    auto K = q.size(3);
+    auto Hv = v.size(2);
+    auto V = v.size(3);
+    at::Tensor q_out = at::empty({B, Hq, T, K}, q.options());
+    at::Tensor k_out = at::empty({B, Hq, T, K}, k.options());
+    at::Tensor w_out = at::empty({B, Hv, T, K}, q.options());
+    at::Tensor u_out = at::empty({B, Hv, T, V}, v.options());
+    at::Tensor g_out = at::empty({B, Hv, T}, g.options());
+    (void)beta;
+    (void)chunk_size;
+    (void)use_qk_l2norm;
+    return std::make_tuple(q_out, k_out, w_out, u_out, g_out);
+}
+
 at::Tensor chunk_fwd_o_meta(
     const at::Tensor & q,
     const at::Tensor & k,
@@ -1551,6 +1577,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("npu_causal_conv1d_310", &vllm_ascend::meta::npu_causal_conv1d_310_meta);
     // npu_recurrent_gated_delta_rule_310
     ops.impl("npu_recurrent_gated_delta_rule_310", &vllm_ascend::meta::npu_recurrent_gated_delta_rule_310_meta);
+    // chunk_gated_delta_rule_fwd_prepare
+    ops.impl("chunk_gated_delta_rule_fwd_prepare", &vllm_ascend::meta::chunk_gated_delta_rule_fwd_prepare_meta);
     // chunk_gated_delta_rule_fwd_h
     ops.impl("chunk_gated_delta_rule_fwd_h", &vllm_ascend::meta::chunk_gated_delta_rule_fwd_h_meta);
     // chunk_fwd_o
@@ -1646,6 +1674,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("npu_lightning_indexer_quant", &vllm_ascend::meta::npu_lightning_indexer_quant_meta);
     // N-gram spec decode
     ops.impl("npu_ngram_spec_decode", &vllm_ascend::meta::npu_ngram_spec_decode_meta);
+    // chunk_gated_delta_rule_fwd_prepare
+    ops.impl("chunk_gated_delta_rule_fwd_prepare", &vllm_ascend::meta::chunk_gated_delta_rule_fwd_prepare_meta);
     // chunk_gated_delta_rule_fwd_h
     ops.impl("chunk_gated_delta_rule_fwd_h", &vllm_ascend::meta::chunk_gated_delta_rule_fwd_h_meta);
     // chunk_fwd_o

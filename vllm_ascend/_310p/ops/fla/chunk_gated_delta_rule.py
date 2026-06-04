@@ -185,29 +185,39 @@ def _ceil_div(value: int, divisor: int) -> int:
     return (value + divisor - 1) // divisor
 
 
-def _require_ascend_chunk_ops(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
+def _require_ascend_chunk_ops(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+) -> None:
     ascend_ops = getattr(torch.ops, "_C_ascend", None)
     if q.device.type != "npu" or ascend_ops is None:
         raise RuntimeError("310P chunk_gated_delta_rule requires NPU AscendC kernels.")
     if not (
-        hasattr(ascend_ops, "chunk_gated_delta_rule_fwd_h")
+        hasattr(ascend_ops, "chunk_gated_delta_rule_fwd_prepare")
+        and hasattr(ascend_ops, "chunk_gated_delta_rule_fwd_h")
         and hasattr(ascend_ops, "chunk_fwd_o")
     ):
         raise RuntimeError(
-            "Missing AscendC chunk-gdr ops: chunk_gated_delta_rule_fwd_h/chunk_fwd_o."
+            "Missing AscendC chunk-gdr ops: "
+            "chunk_gated_delta_rule_fwd_prepare/chunk_gated_delta_rule_fwd_h/chunk_fwd_o."
         )
     if q.dtype != torch.float16 or k.dtype != q.dtype or v.dtype != q.dtype:
         raise TypeError(
             f"q/k/v must share float16 dtype on 310P, got {q.dtype}, {k.dtype}, {v.dtype}."
         )
+    if g.dtype != torch.float32:
+        raise TypeError(f"g must be float32 on 310P, got {g.dtype}.")
+    if beta.dtype != torch.float16:
+        raise TypeError(f"beta must be float16 on 310P, got {beta.dtype}.")
+    if k.shape[-2] != q.shape[-2] or v.shape[-2] % q.shape[-2] != 0:
+        raise ValueError(f"Grouped heads require Hv % Hq == 0, got Hq={q.shape[-2]}, Hv={v.shape[-2]}.")
+    if q.shape[-1] > 256 or v.shape[-1] > 256:
+        raise ValueError(f"310P prepare kernel supports K/V head dim <=256, got K={q.shape[-1]}, V={v.shape[-1]}.")
     if v.shape[-1] < 128 or v.shape[-1] % 128 != 0:
         raise ValueError(f"v head dim must be >=128 and a multiple of 128, got {v.shape[-1]}.")
-
-
-def _maybe_l2norm(x: torch.Tensor, enabled: bool) -> torch.Tensor:
-    if not enabled:
-        return x
-    return F.normalize(x.to(torch.float32), p=2, dim=-1, eps=1e-6).to(x.dtype)
 
 
 def _pad_bthd_to_chunk(
@@ -318,56 +328,6 @@ def _prepare_chunk_indices_list(cu_seqlens: torch.Tensor, chunk_size: int) -> li
     return chunk_indices
 
 
-def _compute_kernel_inputs_from_torch_wy(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    chunk_size: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute the original torch WY prefix and return AscendC kernel layout."""
-    batch_size, padded_tokens, _, k_dim = k.shape
-    num_v_heads = v.shape[2]
-    value_dim = v.shape[-1]
-    num_chunks = padded_tokens // chunk_size
-
-    q_kernel = q.transpose(1, 2).contiguous()
-    k_kernel = k.transpose(1, 2).contiguous()
-
-    key = _expand_qk_to_v_heads(k, num_v_heads).transpose(1, 2).contiguous().to(torch.float32)
-    value = v.transpose(1, 2).contiguous().to(torch.float32)
-    g = g.transpose(1, 2).contiguous().to(torch.float32)
-    beta = beta.transpose(1, 2).contiguous().to(torch.float32)
-
-    key = key.reshape(batch_size, num_v_heads, num_chunks, chunk_size, k_dim)
-    value = value.reshape(batch_size, num_v_heads, num_chunks, chunk_size, value_dim)
-    g = g.reshape(batch_size, num_v_heads, num_chunks, chunk_size).cumsum(dim=-1)
-    beta = beta.reshape(batch_size, num_v_heads, num_chunks, chunk_size)
-
-    lower_decay = (g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float().tril()
-    k_beta = key * beta.unsqueeze(-1)
-    attn = -(k_beta @ key.transpose(-1, -2) * lower_decay)
-    mask_diag = torch.triu(
-        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=k.device),
-        diagonal=0,
-    )
-    attn = attn.masked_fill(mask_diag, 0)
-    for row_idx in range(1, chunk_size):
-        row = attn[..., row_idx, :row_idx].clone()
-        sub = attn[..., :row_idx, :row_idx].clone()
-        attn[..., row_idx, :row_idx] = row + (row.unsqueeze(-1) * sub).sum(-2)
-    attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
-
-    value = attn @ (value * beta.unsqueeze(-1))
-    k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
-
-    u_kernel = value.reshape(batch_size, num_v_heads, padded_tokens, value_dim).to(torch.float16).contiguous()
-    w_kernel = k_cumdecay.reshape(batch_size, num_v_heads, padded_tokens, k_dim).to(torch.float16).contiguous()
-    g_kernel = g.reshape(batch_size, num_v_heads, padded_tokens).contiguous()
-    return q_kernel, k_kernel, w_kernel, u_kernel, g_kernel
-
-
 def _unpad_chunk_output(
     out: torch.Tensor,
     seq_ranges: list[tuple[int, int, int]],
@@ -387,7 +347,8 @@ def _unpad_chunk_output(
         return unpadded[0] if input_was_tnd else unpadded
 
     seq_len = total_tokens
-    return out[:, :seq_len]
+    dense = out[:, :seq_len]
+    return dense[0] if input_was_tnd else dense
 
 
 def chunk_gated_delta_rule_pytorch(
@@ -483,11 +444,11 @@ def chunk_gated_delta_rule_310(
     head_first: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """310P chunk GDN path backed by AscendC fwd_h/fwd_o kernels.
+    """310P chunk GDN path backed by AscendC chunk kernels.
 
-    Triton is unavailable on 310P, so the local WY preparation is done with
-    torch ops and the inter-chunk state/output matmuls are delegated to the
-    custom AscendC kernels.
+    Triton is unavailable on 310P. The prepare phase covers q/k l2norm,
+    q/k layout transform, gate cumsum, and local WY inputs, then delegates
+    inter-chunk state/output work to the existing AscendC fwd_h/fwd_o kernels.
     """
     if head_first:
         raise DeprecationWarning("head_first=True is not supported in 310P chunk path.")
@@ -502,19 +463,17 @@ def chunk_gated_delta_rule_310(
     if g.shape != beta.shape or g.shape[:2] != q.shape[:2] or g.shape[2] != v.shape[2]:
         raise ValueError("g/beta must have shape [B, T, Hv] matching v.")
 
-    _require_ascend_chunk_ops(q, k, v)
-
-    q = _maybe_l2norm(q, use_qk_l2norm_in_kernel)
-    k = _maybe_l2norm(k, use_qk_l2norm_in_kernel)
+    _require_ascend_chunk_ops(q, k, v, g, beta)
 
     original_tokens = v.shape[1]
-    if cu_seqlens is None:
+    single_varlen_sequence = cu_seqlens is not None and cu_seqlens.numel() == 2
+    if cu_seqlens is None or single_varlen_sequence:
         q_pad, k_pad, v_pad, g_pad, beta_pad, seq_ranges, cu_kernel = _pad_bthd_to_chunk(
             q, k, v, g, beta, CHUNK_SIZE
         )
         cu_list = None
         chunk_indices_list = None
-        num_states = q.shape[0]
+        num_states = 1 if single_varlen_sequence else q.shape[0]
     else:
         q_pad, k_pad, v_pad, g_pad, beta_pad, seq_ranges, cu_kernel = _pad_varlen_to_chunk(
             q, k, v, g, beta, cu_seqlens.to(torch.int64).cpu(), CHUNK_SIZE
@@ -539,8 +498,8 @@ def chunk_gated_delta_rule_310(
         return empty_out, final_state
 
     scale = k.shape[-1] ** -0.5 if scale is None else scale
-    q_kernel, k_kernel, w_kernel, u_kernel, g_kernel = _compute_kernel_inputs_from_torch_wy(
-        q_pad, k_pad, v_pad, g_pad, beta_pad, CHUNK_SIZE
+    q_kernel, k_kernel, w_kernel, u_kernel, g_kernel = torch.ops._C_ascend.chunk_gated_delta_rule_fwd_prepare(
+        q_pad, k_pad, v_pad, g_pad, beta_pad, CHUNK_SIZE, use_qk_l2norm_in_kernel
     )
 
     if initial_state is None:
@@ -586,7 +545,13 @@ def chunk_gated_delta_rule_310(
     )
 
     out = o_kernel.transpose(1, 2).contiguous().to(v.dtype)
-    out = _unpad_chunk_output(out, seq_ranges, original_tokens, input_was_tnd, cu_seqlens is not None)
+    out = _unpad_chunk_output(
+        out,
+        seq_ranges,
+        original_tokens,
+        input_was_tnd,
+        cu_seqlens is not None and not single_varlen_sequence,
+    )
     if not output_final_state:
         return out, None
     final_state = final_state_kernel.transpose(-1, -2).contiguous()

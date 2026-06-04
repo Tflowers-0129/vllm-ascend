@@ -2175,6 +2175,70 @@ void npu_scatter_nd_update_v2(
     return;
 }
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> chunk_gated_delta_rule_fwd_prepare(
+    const at::Tensor & q,
+    const at::Tensor & k,
+    const at::Tensor & v,
+    const at::Tensor & g,
+    const at::Tensor & beta,
+    c10::optional<int64_t> chunk_size,
+    c10::optional<bool> use_qk_l2norm)
+{
+#ifdef ASCEND_PLATFORM_310P
+    TORCH_CHECK(q.dtype() == at::kHalf && k.dtype() == at::kHalf && v.dtype() == at::kHalf,
+                "q/k/v must be float16.");
+    TORCH_CHECK(beta.dtype() == at::kHalf, "beta must be float16.");
+    TORCH_CHECK(g.dtype() == at::kFloat, "g must be float32.");
+    TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4 && g.dim() == 3 && beta.dim() == 3,
+                "q/k/v must be BTHD and g/beta must be BTH.");
+    TORCH_CHECK(q.sizes() == k.sizes(), "q and k shapes must match.");
+    TORCH_CHECK(q.size(0) == v.size(0) && q.size(1) == v.size(1), "q/k/v batch and token dims must match.");
+    TORCH_CHECK(g.sizes() == beta.sizes(), "g and beta shapes must match.");
+    TORCH_CHECK(g.size(0) == v.size(0) && g.size(1) == v.size(1) && g.size(2) == v.size(2),
+                "g/beta must match v batch, token, and value-head dims.");
+    int64_t chunk_size_ = chunk_size.value_or(64);
+    bool use_qk_l2norm_ = use_qk_l2norm.value_or(false);
+    TORCH_CHECK(chunk_size_ == 64, "chunk_gated_delta_rule_fwd_prepare only supports chunk_size=64.");
+    TORCH_CHECK(q.size(1) % chunk_size_ == 0, "sequence length must be padded to chunk_size.");
+
+    auto B = q.size(0);
+    auto T = q.size(1);
+    auto Hq = q.size(2);
+    auto K = q.size(3);
+    auto Hv = v.size(2);
+    auto V = v.size(3);
+    TORCH_CHECK(Hq > 0 && Hv % Hq == 0,
+                "Grouped heads require Hv % Hq == 0, got Hq=", Hq, ", Hv=", Hv, ".");
+    TORCH_CHECK(K <= 256 && V <= 256,
+                "chunk_gated_delta_rule_fwd_prepare supports K/V head dim <=256, got K=", K, ", V=", V, ".");
+    TORCH_CHECK(V >= 128 && V % 128 == 0,
+                "chunk_gated_delta_rule_fwd_prepare requires V head dim >=128 and multiple of 128, got V=", V, ".");
+
+    at::Tensor q_out = at::empty({B, Hq, T, K}, q.options());
+    at::Tensor k_out = at::empty({B, Hq, T, K}, k.options());
+    at::Tensor w_out = at::empty({B, Hv, T, K}, q.options());
+    at::Tensor u_out = at::empty({B, Hv, T, V}, v.options());
+    at::Tensor g_out = at::empty({B, Hv, T}, g.options());
+
+    EXEC_NPU_CMD(
+        aclnnChunkGatedDeltaRuleFwdPrepare,
+        q, k, v, g, beta, chunk_size_, use_qk_l2norm_,
+        q_out, k_out, w_out, u_out, g_out
+    );
+    return std::make_tuple(q_out, k_out, w_out, u_out, g_out);
+#else
+    (void)q;
+    (void)k;
+    (void)v;
+    (void)g;
+    (void)beta;
+    (void)chunk_size;
+    (void)use_qk_l2norm;
+    TORCH_CHECK(false, "chunk_gated_delta_rule_fwd_prepare is only available on Ascend 310P.");
+    return std::make_tuple(at::Tensor(), at::Tensor(), at::Tensor(), at::Tensor(), at::Tensor());
+#endif
+}
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor> chunk_gated_delta_rule_fwd_h(
     const at::Tensor & k,
     const at::Tensor & w,
@@ -2212,8 +2276,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> chunk_gated_delta_rule_fwd_h(
         NT = (T + chunk_size_ - 1) / chunk_size_;
     }
 
-    at::Tensor h_out = at::zeros({B, HV, NT, K, V}, k.options());
-    at::Tensor v_new_out = at::zeros(u.sizes(), u.options());
+    at::Tensor h_out = initial_state_.defined() ? at::empty({B, HV, NT, K, V}, k.options())
+                                                : at::zeros({B, HV, NT, K, V}, k.options());
+    at::Tensor v_new_out = at::empty(u.sizes(), u.options());
     at::Tensor final_state_out;
     if (output_final_state_) {
         int N = cu_seqlens.has_value() ? cu_seqlens->size() - 1 : B;
@@ -2255,7 +2320,7 @@ at::Tensor chunk_fwd_o(
     c10::optional<int64_t> chunk_size,
     c10::optional<bool> transpose_state_layout)
 {
-    at::Tensor o = at::zeros(v.sizes(), v.options());
+    at::Tensor o = at::empty(v.sizes(), v.options());
     int64_t chunk_size_ = chunk_size.has_value() ? chunk_size.value() : 64;
     const at::Tensor &g_ = c10::value_or_else(g, [] { return at::Tensor(); });
     (void)g_gamma;
@@ -2303,6 +2368,11 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                                   Tensor? num_accepted_tokens, "
         "                                   float scale_value=1.0) -> (Tensor output)");
     ops.impl("npu_recurrent_gated_delta_rule_310", torch::kPrivateUse1, &vllm_ascend::npu_recurrent_gated_delta_rule_310);
+
+    ops.def(
+        "chunk_gated_delta_rule_fwd_prepare(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, int? chunk_size=None, bool? use_qk_l2norm=None) -> (Tensor q_out, Tensor k_out, Tensor w_out, Tensor u_out, Tensor g_out)"
+    );
+    ops.impl("chunk_gated_delta_rule_fwd_prepare", torch::kPrivateUse1, &vllm_ascend::chunk_gated_delta_rule_fwd_prepare);
 
     ops.def(
         "chunk_gated_delta_rule_fwd_h(Tensor k, Tensor w, Tensor u, Tensor? g=None, *, Tensor? gk=None, Tensor? initial_state=None, bool? output_final_state=False, int? chunk_size=None, bool? save_new_value=True, int[]? cu_seqlens=None, int[]? chunk_indices=None, bool? use_exp2=False, bool? transpose_state_layout=False) -> (Tensor h_out, Tensor v_new_out, Tensor final_state_out)"
@@ -2953,6 +3023,11 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     );
     ops.impl("npu_ngram_spec_decode", torch::kPrivateUse1,
              &vllm_ascend::npu_ngram_spec_decode);
+
+    ops.def(
+        "chunk_gated_delta_rule_fwd_prepare(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, int? chunk_size=None, bool? use_qk_l2norm=None) -> (Tensor q_out, Tensor k_out, Tensor w_out, Tensor u_out, Tensor g_out)"
+    );
+    ops.impl("chunk_gated_delta_rule_fwd_prepare", torch::kPrivateUse1, &vllm_ascend::chunk_gated_delta_rule_fwd_prepare);
 
     ops.def(
         "chunk_gated_delta_rule_fwd_h(Tensor k, Tensor w, Tensor u, Tensor? g=None, *, Tensor? gk=None, Tensor? initial_state=None, bool? output_final_state=False, int? chunk_size=None, bool? save_new_value=True, int[]? cu_seqlens=None, int[]? chunk_indices=None, bool? use_exp2=False, bool? transpose_state_layout=False) -> (Tensor h_out, Tensor v_new_out, Tensor final_state_out)"
