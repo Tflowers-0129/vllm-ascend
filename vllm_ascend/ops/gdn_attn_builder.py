@@ -647,6 +647,20 @@ def _build_non_spec_causal_conv1d_host_meta(
         None if slot is None else slot.has_initial_state_cpu,
     )
 
+    if not hasattr(_build_non_spec_causal_conv1d_host_meta, "_qwen35_debug_count"):
+        _build_non_spec_causal_conv1d_host_meta._qwen35_debug_count = 0
+    if _build_non_spec_causal_conv1d_host_meta._qwen35_debug_count < 128:
+        print(
+            "[QWEN35_DEBUG][GDN_PREFILL_HOST_META] "
+            f"state_idx_device={attn_metadata.non_spec_state_indices_tensor.device} "
+            f"has_initial_device={attn_metadata.has_initial_state.device} "
+            f"qsl={non_spec_query_start_loc_cpu.tolist()} "
+            f"cache_indices={cache_indices_cpu.tolist()} "
+            f"has_initial_state={has_initial_state_cpu.tolist()}",
+            flush=True,
+        )
+        _build_non_spec_causal_conv1d_host_meta._qwen35_debug_count += 1
+
     return GDNCausalConv1dHostMetadata(
         query_start_loc_cpu=non_spec_query_start_loc_cpu,
         cache_indices_cpu=cache_indices_cpu,
@@ -671,6 +685,18 @@ def _build_non_spec_decode_causal_conv1d_host_meta(
         attn_metadata.non_spec_state_indices_tensor,
         None if slot is None else slot.cache_indices_cpu,
     )
+
+    if not hasattr(_build_non_spec_decode_causal_conv1d_host_meta, "_qwen35_debug_count"):
+        _build_non_spec_decode_causal_conv1d_host_meta._qwen35_debug_count = 0
+    if _build_non_spec_decode_causal_conv1d_host_meta._qwen35_debug_count < 128:
+        print(
+            "[QWEN35_DEBUG][GDN_DECODE_HOST_META] "
+            f"state_idx_device={attn_metadata.non_spec_state_indices_tensor.device} "
+            f"qsl={non_spec_query_start_loc_cpu.tolist()} "
+            f"cache_indices={non_spec_cache_indices_cpu.tolist()}",
+            flush=True,
+        )
+        _build_non_spec_decode_causal_conv1d_host_meta._qwen35_debug_count += 1
 
     return GDNCausalConv1dHostMetadata(
         query_start_loc_cpu=non_spec_query_start_loc_cpu,

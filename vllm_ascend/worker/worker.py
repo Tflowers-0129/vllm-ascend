@@ -932,6 +932,14 @@ class NPUWorker(WorkerBase):
         with context:
             self.model_runner.initialize_kv_cache(kv_cache_config)
 
+            print(
+                "[QWEN35_DEBUG][KV_INIT] "
+                f"needs_kv_cache_zeroing={kv_cache_config.needs_kv_cache_zeroing} "
+                f"has_init_kv_zero_meta={hasattr(self.model_runner, '_init_kv_zero_meta')} "
+                f"speculative_config={self.vllm_config.speculative_config}",
+                flush=True,
+            )
+
             # Restrict to mamba and full attn hybrid models (e.g. Qwen3.x).
             #
             # When eagle3 is enabled with num_speculative_tokens>1, mamba blocks may be reallocated to full blocks if
@@ -950,7 +958,16 @@ class NPUWorker(WorkerBase):
                 and self.vllm_config.speculative_config.method == "eagle3"
                 and self.vllm_config.speculative_config.num_speculative_tokens > 1
             ):
+                print(
+                    "[QWEN35_DEBUG][KV_INIT] calling _init_kv_zero_meta",
+                    flush=True,
+                )
                 self.model_runner._init_kv_zero_meta()
+            else:
+                print(
+                    "[QWEN35_DEBUG][KV_INIT] skip _init_kv_zero_meta",
+                    flush=True,
+                )
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
         # Check if profiling is enabled (RFC #6954 - align with upstream vLLM)

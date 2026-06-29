@@ -721,6 +721,18 @@ class NPUModelRunner(GPUModelRunner):
         # This can be removed after the upstream fix is merged.
         req_data = scheduler_output.scheduled_cached_reqs
 
+        if scheduler_output.new_block_ids_to_zero:
+            if not hasattr(self, "_qwen35_debug_zero_count"):
+                self._qwen35_debug_zero_count = 0
+            if self._qwen35_debug_zero_count < 64:
+                print(
+                    "[QWEN35_DEBUG][KV_ZERO] "
+                    f"new_block_ids_to_zero={scheduler_output.new_block_ids_to_zero[:64]} "
+                    f"has_kv_block_zeroer={hasattr(self, '_kv_block_zeroer')}",
+                    flush=True,
+                )
+                self._qwen35_debug_zero_count += 1
+
         if self.use_async_scheduling:
             for i, req_id in enumerate(req_data.req_ids):
                 req_state = self.requests.get(req_id)
