@@ -615,7 +615,7 @@ def _copy_to_pinned_cpu(
         cpu_tensor = pinned_buffer[:num_elements]
     cpu_tensor.copy_(
         tensor.reshape(-1),
-        non_blocking=True,
+        non_blocking=False,
     )
     return cpu_tensor
 
