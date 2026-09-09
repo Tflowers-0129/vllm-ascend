@@ -62,10 +62,6 @@ def test_punica_init_selects_kernel_backend(device_type, max_lora_rank, expect_t
             "vllm_ascend.lora.punica_npu.get_current_hardware_profile",
             return_value=get_hardware_profile(device_type),
         ),
-        patch(
-            "vllm_ascend.lora.punica_npu.get_ascend_device_type",
-            return_value=device_type,
-        ),
         patch("vllm_ascend.lora.punica_npu.refresh_all_lora_classes") as refresh,
     ):
         wrapper = PunicaWrapperNPU(
@@ -85,6 +81,39 @@ def test_punica_init_selects_kernel_backend(device_type, max_lora_rank, expect_t
         assert wrapper.bgmv_shrink is bgmv_shrink
     else:
         assert wrapper.bgmv_shrink is lora_ops.bgmv_shrink
+
+
+@pytest.mark.parametrize(
+    ("device_type", "expected"),
+    [
+        (AscendDeviceType.A2, True),
+        (AscendDeviceType.A3, True),
+        (AscendDeviceType._310P, False),
+        (AscendDeviceType.A5, False),
+    ],
+)
+def test_punica_init_uses_single_adapter_matmul_capability(device_type, expected) -> None:
+    with (
+        patch(
+            "vllm_ascend.lora.punica_npu.get_current_hardware_profile",
+            return_value=get_hardware_profile(device_type),
+        ),
+        patch("vllm_ascend.lora.punica_npu.refresh_all_lora_classes"),
+    ):
+        wrapper = PunicaWrapperNPU(
+            8,
+            2,
+            torch.device("cpu"),
+            lora_config=SimpleNamespace(
+                max_lora_rank=16,
+                max_loras=1,
+                fully_sharded_loras=False,
+                lora_dtype=torch.bfloat16,
+            ),
+        )
+
+    assert wrapper._single_lora_slot is expected
+    assert (wrapper._single_lora_mask is not None) is expected
 
 
 def test_prefill_calls_sgmv_when_lora_active() -> None:

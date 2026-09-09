@@ -38,6 +38,7 @@ class HardwareCapability(Enum):
     IRQ_CPU_RESERVATION = auto()
     LOCAL_KV_COMM_RESOURCE = auto()
     LORA_CUSTOM_OPS = auto()
+    LORA_SINGLE_ADAPTER_MATMUL = auto()
     MLA_DECODE_PROLOG_WITHOUT_ROPE = auto()
     MLAPO_NATIVE_WEIGHTS = auto()
     MC2_FULLMESH_V2_COMM = auto()
@@ -142,6 +143,7 @@ _STANDARD_CAPABILITIES = frozenset(
         HardwareCapability.GRAPH_NORM_QUANT_FUSION,
         HardwareCapability.IRQ_CPU_RESERVATION,
         HardwareCapability.LORA_CUSTOM_OPS,
+        HardwareCapability.LORA_SINGLE_ADAPTER_MATMUL,
         HardwareCapability.MC2_HIERARCHY_COMM,
         HardwareCapability.NPUGRAPH_EX,
         HardwareCapability.PAGED_ATTENTION,

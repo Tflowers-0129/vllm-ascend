@@ -33,6 +33,7 @@ _STANDARD_CAPABILITIES = frozenset(
         HardwareCapability.GRAPH_NORM_QUANT_FUSION,
         HardwareCapability.IRQ_CPU_RESERVATION,
         HardwareCapability.LORA_CUSTOM_OPS,
+        HardwareCapability.LORA_SINGLE_ADAPTER_MATMUL,
         HardwareCapability.MC2_HIERARCHY_COMM,
         HardwareCapability.NPUGRAPH_EX,
         HardwareCapability.PAGED_ATTENTION,
