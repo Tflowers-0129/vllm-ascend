@@ -27,7 +27,10 @@ if TYPE_CHECKING:
 else:
     VllmConfig = None
 
-from vllm_ascend.utils import is_310p
+from vllm_ascend.device.hardware_profile import (
+    HardwareCapability,
+    get_current_hardware_profile,
+)
 
 # Architectures for which Model Runner V2 is enabled by default on Ascend.
 DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
@@ -162,8 +165,10 @@ def _v2_model_runner_environment_ready(vllm_config: VllmConfig) -> bool:
     if not is_supported_v2_model_runner_feature(vllm_config):
         return False
 
-    if is_310p():
-        logger.warning_once("Model Runner V2 is not supported on 310P; using the V1 model runner instead.")
+    if not get_current_hardware_profile().supports(HardwareCapability.MODEL_RUNNER_V2):
+        logger.warning_once(
+            "Model Runner V2 is not supported by the current hardware profile; using the V1 model runner instead."
+        )
         return False
 
     from vllm.triton_utils import HAS_TRITON
