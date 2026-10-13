@@ -177,6 +177,34 @@ def test_shared_sfa_nope_metadata_pages_lengths_and_draft_buffers(monkeypatch, b
     assert draft.block_table[0, 0] == 5 * page_multiplier
 
 
+def test_mtp_nope_plan_uses_changing_device_active_count_at_fixed_capacity(monkeypatch):
+    builder = _builder(128, True, monkeypatch)
+    plans = []
+
+    def plan(**kwargs):
+        plans.append(kwargs["ori_topk_length"].clone())
+        return torch.zeros(sfa.SMLA_METADATA_SIZE, dtype=torch.int32)
+
+    monkeypatch.setattr(sfa, "sparse_flash_mla_metadata", plan)
+    common = _common(128)
+    common.num_actual_tokens = common.num_input_tokens = 2
+    common.positions = torch.tensor([128, 129])
+    common.slot_mapping = common.slot_mapping[:2]
+    common.query_start_loc_cpu = torch.tensor([0, 1, 2], dtype=torch.int32)
+    common.query_start_loc = common.query_start_loc_cpu.clone()
+    common.num_actual_tokens_tensor = torch.tensor(2, dtype=torch.int32)
+    addresses = []
+    for actual in (2, 0, 1, 2):
+        common.num_actual_tokens_tensor.fill_(actual)
+        common.query_start_loc.copy_(torch.arange(3).clamp(max=actual))
+        metadata = builder.build_for_drafting(common, 1)
+        assert metadata.num_actual_tokens_tensor is common.num_actual_tokens_tensor
+        assert metadata.smla_topk_length[:, 0].tolist() == [7 if row < actual else 0 for row in range(2)]
+        addresses.append((metadata.smla_topk_length.data_ptr(), metadata.smla_metadata.data_ptr()))
+    assert len(set(addresses)) == 1
+    assert [values[:, 0].tolist() for values in plans] == [[7, 7], [0, 0], [7, 0], [7, 7]]
+
+
 def test_a3_sparse_mla_preserves_storage_addresses(monkeypatch):
     block_size = 2304
     builder = _builder(block_size, False, monkeypatch)

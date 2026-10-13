@@ -337,7 +337,12 @@ class SparseMLAMetadataState:
             # positions left behind by an earlier, larger batch while their
             # sequence lengths are zero. Bound the mask by the unpadded token
             # count, so padding never claims a top-k length with no KV behind it.
-            valid = torch.arange(positions.numel(), device=positions.device) < metadata.num_actual_tokens
+            actual_tokens = (
+                metadata.num_actual_tokens_tensor
+                if metadata.num_actual_tokens_tensor is not None
+                else metadata.num_actual_tokens
+            )
+            valid = torch.arange(positions.numel(), device=positions.device) < actual_tokens
             lengths[:, 0].copy_(counts.masked_fill(~valid, 0))
             metadata.smla_topk_length = lengths
             metadata.smla_sinks = self.sinks
@@ -469,6 +474,8 @@ class AscendSFAMetadata:
     query_start_loc: torch.Tensor | None = None
     max_query_len: int = 0
     max_seq_len: int = 0
+    # MTP graphs keep a fixed row capacity while device-side active counts vary.
+    num_actual_tokens_tensor: torch.Tensor | None = None
     smla_metadata: torch.Tensor | None = None
     smla_topk_length: torch.Tensor | None = None
     smla_sinks: torch.Tensor | None = None
@@ -737,6 +744,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             query_start_loc=common_attn_metadata.query_start_loc[: num_reqs + 1],
             max_query_len=common_attn_metadata.max_query_len,
             max_seq_len=common_attn_metadata.max_seq_len,
+            num_actual_tokens_tensor=getattr(common_attn_metadata, "num_actual_tokens_tensor", None),
             block_size=block_size,
             **parallel_metadata,
         )
