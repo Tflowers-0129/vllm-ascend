@@ -56,10 +56,17 @@ def _dequantize_rows(packed: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     return quantized * scale
 
 
-@pytest.mark.parametrize("quant_dtype", [torch.int8, pytest.param(torch.float8_e4m3fn, marks=REQUIRES_A5_FP8)])
+@pytest.mark.parametrize(
+    "quant_dtype,planar",
+    [
+        (torch.int8, False),
+        pytest.param(torch.float8_e4m3fn, False, marks=REQUIRES_A5_FP8),
+        pytest.param(torch.float8_e4m3fn, True, marks=REQUIRES_A5_FP8),
+    ],
+)
 @pytest.mark.parametrize("page_padding", [0, 128])
 @torch.inference_mode()
-def test_kpool_li_c8_compress_packs_quantized_rows(quant_dtype, page_padding):
+def test_kpool_li_c8_compress_packs_quantized_rows(quant_dtype, planar, page_padding):
     generator = torch.Generator().manual_seed(23)
     lengths = [20, 32]
     num_blocks, rows_per_block = 3, 8
@@ -73,8 +80,19 @@ def test_kpool_li_c8_compress_packs_quantized_rows(quant_dtype, page_padding):
     tail = torch.zeros(2, 2, POOL_SIZE, HEAD_DIM, device="npu")
     page_bytes = rows_per_block * ROW_WIDTH + page_padding
     raw = torch.full((num_blocks * page_bytes,), SENTINEL, dtype=torch.uint8, device="npu")
-    backing = torch.as_strided(raw, (num_blocks, rows_per_block, 1, ROW_WIDTH), (page_bytes, ROW_WIDTH, ROW_WIDTH, 1))
+    width = HEAD_DIM if planar else ROW_WIDTH
+    backing = torch.as_strided(raw, (num_blocks, rows_per_block, 1, width), (page_bytes, width, width, 1))
     cache = backing.view(quant_dtype)
+    scales = (
+        torch.as_strided(
+            raw.view(torch.float32),
+            (num_blocks, rows_per_block, 1, 1),
+            (page_bytes // 4, 1, 1, 1),
+            storage_offset=rows_per_block * HEAD_DIM // 4,
+        )
+        if planar
+        else None
+    )
 
     positions, tail_slots, pool_slots, input_k, input_g = [], [], [], [], []
     expected_rows: dict[int, torch.Tensor] = {}
@@ -106,9 +124,11 @@ def test_kpool_li_c8_compress_packs_quantized_rows(quant_dtype, page_padding):
         torch.tensor([[i] for i in tail_ids], dtype=torch.int32).npu(),
         torch.tensor(pool_slots, device="npu"),
         POOL_SIZE,
+        indexer_scale_cache=scales,
     )
 
     packed = backing.cpu()
+    host_scales = scales.cpu() if planar else None
     quant_max = _quant_max(quant_dtype)
     # Each side rounds to its own grid point: a one-level flip near a rounding
     # boundary stays within one full quantization step of the FP32 reference.
@@ -116,6 +136,8 @@ def test_kpool_li_c8_compress_packs_quantized_rows(quant_dtype, page_padding):
     for slot, pooled in expected_rows.items():
         block, row = divmod(slot, rows_per_block)
         packed_row = packed[block, row, 0]
+        if planar:
+            packed_row = torch.cat((packed_row, host_scales[block, row, 0].view(torch.uint8)))
         scale = packed_row[HEAD_DIM:].view(torch.float32)
         expected_scale = pooled.abs().amax() / quant_max
         torch.testing.assert_close(scale, expected_scale.reshape(1), rtol=1e-6, atol=0)
@@ -127,16 +149,23 @@ def test_kpool_li_c8_compress_packs_quantized_rows(quant_dtype, page_padding):
             atol=float(expected_scale) * (atol_ratio * quant_max) + 1e-4,
         )
     # Block 1 owns no request and must keep the sentinel pattern.
-    assert bool((packed[1] == SENTINEL).all())
+    assert bool((raw.view(num_blocks, page_bytes)[1] == SENTINEL).all())
     if page_padding:
         assert bool((raw.view(num_blocks, page_bytes)[:, -page_padding:] == SENTINEL).all())
 
 
-@pytest.mark.parametrize("quant_dtype", [torch.int8])
+@pytest.mark.parametrize(
+    "quant_dtype,planar",
+    [
+        (torch.int8, False),
+        pytest.param(torch.float8_e4m3fn, False, marks=REQUIRES_A5_FP8),
+        pytest.param(torch.float8_e4m3fn, True, marks=REQUIRES_A5_FP8),
+    ],
+)
 @pytest.mark.parametrize("packing", ["paged", "packed"])
 @pytest.mark.parametrize("page_padding", [0, 128])
 @torch.inference_mode()
-def test_kpool_li_c8_score_dequantizes_rows(quant_dtype, packing, page_padding):
+def test_kpool_li_c8_score_dequantizes_rows(quant_dtype, planar, packing, page_padding):
     generator = torch.Generator().manual_seed(31)
     num_heads, index_topk = 32, 8
     rows_per_req, rows_per_block = 16, 8
@@ -152,9 +181,19 @@ def test_kpool_li_c8_score_dequantizes_rows(quant_dtype, packing, page_padding):
             backing[block, row % rows_per_block, 0] = packed_rows[req * rows_per_req + row]
     page_bytes = rows_per_block * ROW_WIDTH + page_padding
     raw = torch.full((4 * page_bytes,), SENTINEL, dtype=torch.uint8, device="npu")
-    cache_bytes = torch.as_strided(raw, backing.shape, (page_bytes, ROW_WIDTH, ROW_WIDTH, 1))
-    cache_bytes.copy_(backing)
+    width = HEAD_DIM if planar else ROW_WIDTH
+    cache_bytes = torch.as_strided(raw, (*backing.shape[:-1], width), (page_bytes, width, width, 1))
+    cache_bytes.copy_(backing[..., :width])
     cache = cache_bytes.view(quant_dtype)
+    scales = None
+    if planar:
+        scales = torch.as_strided(
+            raw.view(torch.float32),
+            (4, rows_per_block, 1, 1),
+            (page_bytes // 4, 1, 1, 1),
+            storage_offset=rows_per_block * HEAD_DIM // 4,
+        )
+        scales.copy_(backing[..., HEAD_DIM:].contiguous().view(torch.float32))
     dequantized = _dequantize_rows(packed_rows, quant_dtype).reshape(2, rows_per_req, HEAD_DIM)
 
     last_pos = rows_per_req * POOL_SIZE + 2
@@ -177,6 +216,7 @@ def test_kpool_li_c8_score_dequantizes_rows(quant_dtype, packing, page_padding):
         index_kpool=POOL_SIZE,
         max_pool_seq_len=rows_per_req,
         pack_tail=True,
+        indexer_scale_cache=scales,
     )
 
     result, query, weights = result.cpu(), query.cpu(), weights.cpu()
@@ -202,13 +242,11 @@ def test_kpool_li_c8_score_dequantizes_rows(quant_dtype, packing, page_padding):
 
 
 @torch.inference_mode()
-def test_kpool_li_c8_score_rejects_fp8_rows():
-    # The score kernel unpacks quantized rows from INT16 word pairs, which
-    # only supports int8 payloads; fp8 rows must be rejected explicitly.
-    cache = torch.zeros((2, 8, 1, ROW_WIDTH), dtype=torch.uint8).npu().view(torch.float8_e4m3fn)
+def test_kpool_fp8_planar_score_requires_matching_fp32_scales():
+    cache = torch.zeros((2, 8, 1, HEAD_DIM), dtype=torch.uint8).npu().view(torch.float8_e4m3fn)
     query = torch.zeros((1, 2, HEAD_DIM), dtype=torch.bfloat16, device="npu")
     weights = torch.zeros((1, 2), dtype=torch.bfloat16, device="npu")
-    with pytest.raises(NotImplementedError, match="int8"):
+    with pytest.raises(ValueError, match="row width"):
         score(
             query,
             cache,

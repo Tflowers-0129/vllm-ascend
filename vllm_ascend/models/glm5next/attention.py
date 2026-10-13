@@ -106,7 +106,8 @@ class Indexer(nn.Module):
         self.scale_fmt = None
         self.quant_block_size = self.head_dim
         self.topk_indices_buffer = topk_indices_buffer
-        # INT8 uses Triton packed rows; FP8 uses CANN keys and FP32 descales.
+        # A5 FP8 uses the same key/FP32 descale planes for CANN TP and Triton
+        # DSA-CP, keeping the P/D transfer format independent of the backend.
         # These choices do not change the independent SFA KV-cache dtype.
         indexer_dtype = {
             "int8": torch.int8,
