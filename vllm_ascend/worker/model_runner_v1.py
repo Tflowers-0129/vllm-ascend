@@ -6774,6 +6774,8 @@ class NPUModelRunner(GPUModelRunner):
                         non_causal_multi_token_decode=spec.non_causal_multi_token_decode,
                         model_version=model_version,
                         indexes_kv_by_block_stride=indexes_kv_by_block_stride,
+                        scale_dim=getattr(spec, "scale_dim", 0),
+                        scale_dtype=getattr(spec, "scale_dtype", torch.int8),
                         **ratio_kwargs,
                     )
                     attn_layer_names.add(layer_name)
