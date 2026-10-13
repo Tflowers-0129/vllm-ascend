@@ -256,7 +256,7 @@ def test_indexer_metadata_addresses_complete_storage_pages(storage_block_size):
     torch.testing.assert_close(draft.block_table, common.block_table_tensor[:1])
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.int8, torch.float8_e4m3fn])
 def test_model_cache_layers_publish_source_compatible_specs(dtype):
     current_config = SimpleNamespace(
         parallel_config=SimpleNamespace(pipeline_parallel_size=2),
@@ -296,8 +296,8 @@ def test_model_cache_layers_publish_source_compatible_specs(dtype):
     assert indexer_spec.model_version == "glm5_next"
     assert indexer_spec.indexes_kv_by_block_stride
     assert indexer_spec.dtype == dtype
-    assert indexer_spec.scale_dim == (1 if dtype == torch.float8_e4m3fn else 0)
-    if dtype == torch.float8_e4m3fn:
+    assert indexer_spec.scale_dim == (1 if dtype in (torch.int8, torch.float8_e4m3fn) else 0)
+    if dtype in (torch.int8, torch.float8_e4m3fn):
         assert indexer_spec.scale_dtype == torch.float32
         assert indexer_spec.real_page_size_bytes == 16 * (128 + 4)
     assert state_spec.block_size == state_spec.sliding_window == 16

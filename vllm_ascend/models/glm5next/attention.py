@@ -106,11 +106,15 @@ class Indexer(nn.Module):
         self.scale_fmt = None
         self.quant_block_size = self.head_dim
         self.topk_indices_buffer = topk_indices_buffer
-        # KeyPool projects in BF16; completed pools optionally store FP8 keys
-        # with a per-pool FP32 descale for CANN PoolKeyIndexer.
+        # INT8 uses Triton packed rows; FP8 uses CANN keys and FP32 descales.
+        # These choices do not change the independent SFA KV-cache dtype.
+        indexer_dtype = {
+            "int8": torch.int8,
+            "fp8": torch.float8_e4m3fn,
+        }.get(vllm_config.attention_config.indexer_kv_dtype, torch.bfloat16)
         self.k_cache = Glm5NextIndexerCache(
             head_dim=self.head_dim,
-            dtype=(torch.float8_e4m3fn if vllm_config.attention_config.indexer_kv_dtype == "fp8" else torch.bfloat16),
+            dtype=indexer_dtype,
             cache_role="indexer",
             prefix=f"{prefix}.k_cache",
             cache_config=cache_config,

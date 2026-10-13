@@ -1983,6 +1983,79 @@ class TestTopLevelSwitchTypeValidation(TestBase):
         self.assertTrue(config.enable_sparse_sfa_c8)
 
     @_clean_up
+    @patch("vllm_ascend.utils.model_uses_sfa_sparse")
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_c8_reshape_optim_is_initialized_from_sfa_li_c8_and_pd_role(
+        self,
+        mock_fix,
+        mock_uses_sfa,
+    ):
+        cases = (
+            (None, True, True, "kv_producer", True),
+            (False, True, True, "kv_producer", False),
+            (True, False, True, "kv_producer", False),
+            (True, True, False, "kv_producer", False),
+            (True, True, True, "kv_consumer", False),
+            (True, True, True, "kv_both", False),
+            (True, True, True, None, False),
+        )
+        for reshape_optim, uses_sfa, enable_li_c8, kv_role, expected in cases:
+            with self.subTest(
+                reshape_optim=reshape_optim,
+                uses_sfa=uses_sfa,
+                enable_li_c8=enable_li_c8,
+                kv_role=kv_role,
+            ):
+                mock_uses_sfa.return_value = uses_sfa
+                vc = VllmConfig()
+                vc.additional_config = {
+                    "refresh": True,
+                    "enable_sparse_li_c8": enable_li_c8,
+                }
+                if reshape_optim is not None:
+                    vc.additional_config["c8_enable_reshape_optim"] = reshape_optim
+                # enable_sparse_li_c8 is derived from indexer_kv_dtype (see
+                # init_ascend_config); the per-case flag is expressed there.
+                vc.attention_config.indexer_kv_dtype = "int8" if enable_li_c8 else "auto"
+                if kv_role is not None:
+                    vc.kv_transfer_config = KVTransferConfig(
+                        kv_connector="MooncakeConnectorV1",
+                        kv_role=kv_role,
+                    )
+
+                config = init_ascend_config(vc)
+
+                self.assertEqual(config.c8_reshape_optim_enabled, expected)
+
+    @_clean_up
+    @patch("vllm_ascend.utils.model_uses_kpool_indexer", return_value=True)
+    @patch("vllm_ascend.utils.model_uses_sfa_sparse", return_value=False)
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_kpool_li_c8_bypasses_float_weight_filter(self, mock_fix, mock_sparse, mock_kpool):
+        for dtype in ("int8", "fp8", "auto"):
+            with self.subTest(dtype=dtype):
+                vc = VllmConfig()
+                vc.quant_config = SimpleNamespace(
+                    quant_description={"model.layers.3.self_attn.indexer.wq_b.weight": "FLOAT"}
+                )
+                vc.attention_config.indexer_kv_dtype = dtype
+                vc.cache_config.cache_dtype = "fp8"
+                config = init_ascend_config(vc)
+                self.assertEqual(config.is_kpool_li_c8_enabled(), dtype != "auto")
+                self.assertFalse(config.is_sparse_li_c8_layer("model.layers.3.self_attn.indexer.k_cache"))
+                self.assertTrue(config.enable_sparse_sfa_c8)
+
+    @_clean_up
+    @patch("vllm_ascend.utils.model_uses_kpool_indexer", return_value=True)
+    @patch("vllm_ascend.utils.model_uses_sfa_sparse", return_value=False)
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_kpool_li_c4_is_rejected(self, mock_fix, mock_sparse, mock_kpool):
+        vc = VllmConfig()
+        vc.attention_config.indexer_kv_dtype = "mxfp4"
+        with self.assertRaisesRegex(ValueError, "KPool indexer does not support LI C4"):
+            init_ascend_config(vc)
+
+    @_clean_up
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
     def test_rejection_sampler_config_survives_factory(self, mock_fix):
         vc = VllmConfig()
