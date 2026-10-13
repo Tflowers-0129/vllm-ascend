@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import importlib.util
+import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -18,6 +19,7 @@ from vllm_ascend.attention.indexer_kpool import (
     AscendIndexerKPoolTailMetadata,
     Glm5NextKPoolIndexerBackend,
 )
+from vllm_ascend.device.hardware_profile import AttentionBackendFamily
 
 # The operator PR owns these kernels. Each orchestration test below replaces
 # the kernel call with an asserting CPU implementation.
@@ -49,6 +51,48 @@ def test_cache_metadata_import_does_not_require_indexer_operators() -> None:
 
     assert module.AscendIndexerKPoolBackend.get_builder_cls() is module.AscendIndexerKPoolMetadataBuilder
     assert module.AscendIndexerKPoolTailBackend.get_builder_cls() is module.AscendIndexerKPoolTailMetadataBuilder
+
+
+@pytest.mark.parametrize("dsa_cp", [False, True])
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.int8, torch.float8_e4m3fn])
+def test_backend_selects_cache_compatible_operator(monkeypatch, dsa_cp, cache_dtype):
+    monkeypatch.setattr(backend_module, "enable_dsa_cp", lambda: dsa_cp)
+    monkeypatch.setattr(
+        backend_module,
+        "get_current_hardware_profile",
+        lambda: SimpleNamespace(attention_backend_family=AttentionBackendFamily.STANDARD),
+    )
+    triton_op, cann_op = MagicMock(), MagicMock()
+    monkeypatch.setitem(sys.modules, "vllm_ascend.models.glm5next.sparse_attn_indexer_kpool", kpool_module)
+    monkeypatch.setitem(sys.modules, "vllm_ascend.models.glm5next.sparse_attn_indexer_kpool_cann", cann_module)
+    monkeypatch.setattr(kpool_module, "SparseAttnIndexerKpool", triton_op)
+    monkeypatch.setattr(cann_module, "SparseAttnIndexerKpool", cann_op)
+    source = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                prefill_context_parallel_size=1,
+                decode_context_parallel_size=1,
+            )
+        ),
+        n_head=2,
+        head_dim=2,
+        topk_tokens=4,
+        q_lora_rank=2,
+        index_kpool=4,
+        wq_b=nn.Linear(2, 4),
+        wk_weights_proj=nn.Linear(3, 4),
+        k_norm=nn.LayerNorm(2),
+        softmax_scale=0.5,
+        index_kpool_compress_ape=nn.Parameter(torch.zeros(4, 2)),
+        index_kpool_compress_gate=nn.Parameter(torch.zeros(2, 3)),
+        k_cache=SimpleNamespace(dtype=cache_dtype),
+        tail_cache=SimpleNamespace(),
+        topk_indices_buffer=None,
+    )
+    backend = Glm5NextKPoolIndexerBackend(source, qk_rope_head_dim=0)
+    assert backend.indexer_op is (triton_op if dsa_cp or cache_dtype == torch.int8 else cann_op).return_value
+    assert backend.num_cache_tensors == (2 if cache_dtype == torch.float8_e4m3fn else 1)
+    assert backend.enable_sparse_li_c8 == (cache_dtype != torch.bfloat16)
 
 
 @pytest.mark.parametrize("pool_size", [1, 4])
@@ -222,10 +266,12 @@ class _RecordingKPool(nn.Module):
 
 @pytest.mark.parametrize("graph_mode", [CUDAGraphMode.NONE, CUDAGraphMode.FULL])
 @pytest.mark.parametrize("dsa_cp", [False, True])
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.int8])
 def test_backend_uses_normalized_q_c_and_separate_tail_metadata(
     monkeypatch,
     graph_mode,
     dsa_cp,
+    cache_dtype,
 ) -> None:
     monkeypatch.setattr(backend_module, "enable_dsa_cp", lambda: dsa_cp)
     backend = Glm5NextKPoolIndexerBackend.__new__(Glm5NextKPoolIndexerBackend)
@@ -241,7 +287,8 @@ def test_backend_uses_normalized_q_c_and_separate_tail_metadata(
     backend.index_kpool_compress_gate = nn.Parameter(torch.zeros(2, 3))
     backend.k_cache = SimpleNamespace(
         prefix="indexer.k_cache",
-        kv_cache=torch.zeros(2, 2, 1, 2, dtype=torch.bfloat16),
+        dtype=cache_dtype,
+        kv_cache=torch.zeros(2, 2, 1, 6 if cache_dtype == torch.int8 else 2, dtype=cache_dtype),
     )
     backend.tail_cache = SimpleNamespace(
         prefix="indexer.tail",
@@ -300,7 +347,7 @@ def test_backend_uses_normalized_q_c_and_separate_tail_metadata(
     torch.testing.assert_close(
         backend.indexer_op.args[1], normalized_q_c[:expected_rows].repeat(1, 2).view(expected_rows, 2, 2)
     )
-    if dsa_cp:
+    if dsa_cp or cache_dtype == torch.int8:
         expected_k = torch.nn.functional.layer_norm(
             torch.nn.functional.linear(hidden[:expected_rows] + 3, backend.wk_weights_proj.weight)[:, :2],
             (2,),
@@ -308,9 +355,12 @@ def test_backend_uses_normalized_q_c_and_separate_tail_metadata(
             backend.k_norm.bias,
             backend.k_norm.eps,
         )
-        torch.testing.assert_close(backend.indexer_op.args[0], torch.cat((expected_k, expected_k)))
+        torch.testing.assert_close(
+            backend.indexer_op.args[0], torch.cat((expected_k, expected_k)) if dsa_cp else expected_k
+        )
         assert backend.indexer_op.kwargs["query_metadata"] is metadata.query_metadata
         assert backend.indexer_op.args[5].shape == (2, 2, 4, 2)
+        assert backend.indexer_op.args[4].dtype == cache_dtype
     else:
         torch.testing.assert_close(backend.indexer_op.args[0], hidden[:expected_rows] + 3)
         torch.testing.assert_close(backend.indexer_op.kwargs["key_weight"], backend.wk_weights_proj.weight[:2])
@@ -325,7 +375,8 @@ def test_backend_uses_normalized_q_c_and_separate_tail_metadata(
     assert backend.indexer_op.kwargs["output_buffer"] is backend.topk_indices_buffer
 
 
-def test_dsacp_kpool_compresses_global_tokens_and_selects_local_queries(monkeypatch):
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.int8])
+def test_dsacp_kpool_compresses_global_tokens_and_selects_local_queries(monkeypatch, cache_dtype):
     metadata = _indexer_metadata()
     local_positions = metadata.positions[4:]
     query_metadata = AscendIndexerKPoolQueryMetadata(
@@ -340,7 +391,7 @@ def test_dsacp_kpool_compresses_global_tokens_and_selects_local_queries(monkeypa
         torch.zeros(4, 1, 2, dtype=torch.bfloat16),
         torch.ones(4, 1, dtype=torch.bfloat16),
         metadata.positions,
-        torch.zeros(2, 2, 1, 2, dtype=torch.bfloat16),
+        torch.zeros(2, 2, 1, 6 if cache_dtype == torch.int8 else 2, dtype=cache_dtype),
         torch.zeros(2, 2, 4, 2),
         metadata,
         _tail_metadata(),

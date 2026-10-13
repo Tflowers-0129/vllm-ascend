@@ -24,7 +24,7 @@ from vllm_ascend.models.glm5next.cache_config import (
     get_glm5_next_kv_cache_groups,
     get_glm5_next_pool_bytes_per_block,
 )
-from vllm_ascend.models.glm5next.cache_views import view_kpool_tail_cache
+from vllm_ascend.models.glm5next.cache_views import view_compressed_indexer_cache, view_kpool_tail_cache
 from vllm_ascend.utils import get_kv_cache_tensor_layers
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 from vllm_ascend.worker.v2 import attn_utils
@@ -304,6 +304,54 @@ def test_glm_fp8_indexer_keys_and_scales_share_padded_pages_without_overlapping(
     assert torch.count_nonzero(key[2].view(torch.uint8)) == 0
     assert torch.count_nonzero(scale[:2]) == 0
     assert torch.all(key[1].view(torch.uint8) == 23)
+
+
+@pytest.mark.parametrize("page_bytes", [38016, 46080])
+def test_int8_indexer_packs_rows_inside_each_kernel_page(page_bytes):
+    spec = AscendMLAAttentionSpec(
+        block_size=1152,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.int8,
+        scale_dim=1,
+        scale_dtype=torch.float32,
+        model_version="glm5_next",
+        indexes_kv_by_block_stride=True,
+        tokens_per_state=4,
+        page_size_padded=page_bytes,
+    )
+    raw = torch.zeros(3 * page_bytes, dtype=torch.uint8)
+    (view,) = view_compressed_indexer_cache(INDEXER, spec, raw, _AttentionBackend, 128)
+    assert view.shape == (27, 32, 1, 132)
+    assert view.stride() == (page_bytes // 9, 132, 132, 1)
+    assert view.data_ptr() == raw.data_ptr()
+    assert view.view(torch.int16).shape[-1] == 66
+    # Scheduler page 1, kernel block 2, pooled row 5, payload byte 7.
+    offset = page_bytes + 2 * (page_bytes // 9) + 5 * 132 + 7
+    raw[offset] = 83
+    assert view[11, 5, 0, 7] == 83
+    view[26, 31, 0, 131] = -5
+    assert raw.view(torch.int8)[2 * page_bytes + 8 * (page_bytes // 9) + 31 * 132 + 131] == -5
+    if page_bytes > 38016:
+        view.fill_(7)
+        assert torch.count_nonzero(raw[4224 : page_bytes // 9]) == 0
+
+
+def test_int8_indexer_rejects_nonuniform_kernel_pages():
+    spec = AscendMLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.int8,
+        scale_dim=1,
+        scale_dtype=torch.float32,
+        tokens_per_state=4,
+        model_version="glm5_next",
+        indexes_kv_by_block_stride=True,
+        page_size_padded=8449,
+    )
+    with pytest.raises(ValueError, match="aligned kernel pages"):
+        view_compressed_indexer_cache(INDEXER, spec, torch.zeros(8449, dtype=torch.uint8), _AttentionBackend, 128)
 
 
 def test_standalone_mtp_uses_existing_compressed_cache_allocator():

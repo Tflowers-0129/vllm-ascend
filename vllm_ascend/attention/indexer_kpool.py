@@ -12,6 +12,7 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import get_tp_group
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -31,6 +32,8 @@ from vllm_ascend.device.hardware_profile import AttentionBackendFamily, get_curr
 from vllm_ascend.utils import _round_up, enable_dsa_cp
 
 GLM5_NEXT_SFA_KERNEL_BLOCK_SIZE = 128
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -548,13 +551,20 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
         self.topk_indices_buffer: torch.Tensor | None = vllm_indexer.topk_indices_buffer
         # Load KPool operators only when constructing the model-side backend;
         # cache metadata is also imported during engine initialization.
-        if enable_dsa_cp():
+        if enable_dsa_cp() or self.k_cache.dtype == torch.int8:
             from vllm_ascend.models.glm5next.sparse_attn_indexer_kpool import SparseAttnIndexerKpool
         else:
             from vllm_ascend.models.glm5next.sparse_attn_indexer_kpool_cann import SparseAttnIndexerKpool
 
         self.indexer_op = SparseAttnIndexerKpool(self.topk_tokens, self.head_dim)
-        self.enable_sparse_li_c8 = self.k_cache.dtype == torch.float8_e4m3fn
+        self.enable_sparse_li_c8 = self.k_cache.dtype in (torch.int8, torch.float8_e4m3fn)
+        if self.enable_sparse_li_c8:
+            logger.info_once(
+                "KPool indexer LI C8 enabled: dtype=%s, backend=%s, dsa_cp=%s",
+                self.k_cache.dtype,
+                "Triton" if self.k_cache.dtype == torch.int8 else "CANN",
+                enable_dsa_cp(),
+            )
         for name in (
             "_key_weight",
             "_gate_weight",
@@ -577,10 +587,10 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
 
     @property
     def num_cache_tensors(self) -> int:
-        return 2 if self.enable_sparse_li_c8 else 1
+        return 2 if self.k_cache.dtype == torch.float8_e4m3fn else 1
 
     def process_weights_after_loading(self) -> None:
-        if enable_dsa_cp():
+        if enable_dsa_cp() or self.k_cache.dtype == torch.int8:
             self._wk_weight_f32 = self.wk_weights_proj.weight.detach().float()
             self._gate_weight_f32 = self.index_kpool_compress_gate.detach().float()
         self._key_weight = self.wk_weights_proj.weight[: self.head_dim].detach().contiguous()
@@ -636,7 +646,8 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
             self.process_weights_after_loading()
         assert self._key_weight is not None
         cp_hidden = cp_projected = None
-        if indexer_metadata.query_metadata is not None:
+        use_triton = indexer_metadata.query_metadata is not None or self.k_cache.dtype == torch.int8
+        if use_triton:
             assert self._wk_weight_f32 is not None
             cp_hidden = k_hidden.float()
             cp_projected = F.linear(cp_hidden, self._wk_weight_f32)
@@ -658,7 +669,7 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
             self._bound_cache(self.k_cache, slot=1) if indexer_cache.dtype == torch.float8_e4m3fn else None
         )
         tail_cache = self._bound_cache(self.tail_cache)
-        if indexer_metadata.query_metadata is not None:
+        if use_triton:
             if indexer_scale_cache is not None:
                 raise NotImplementedError("GLM KPool FP8 LI does not support DSA context parallelism.")
             assert cp_projected is not None and cp_hidden is not None and self._gate_weight_f32 is not None
@@ -670,8 +681,11 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
                 getattr(self.k_norm, "eps", getattr(self.k_norm, "variance_epsilon", 1e-6)),
             )
             gate_score = F.linear(cp_hidden, self._gate_weight_f32)
-            gathered = get_tp_group().all_gather(torch.cat((k, gate_score), dim=-1), dim=0)
-            k, gate_score = gathered.split(self.head_dim, dim=-1)
+            if indexer_metadata.query_metadata is not None:
+                # Gather global K/gate rows before per-rank pooling and INT8
+                # quantization; top-k continues to use rank-local queries.
+                gathered = get_tp_group().all_gather(torch.cat((k, gate_score), dim=-1), dim=0)
+                k, gate_score = gathered.split(self.head_dim, dim=-1)
             tail_planes = tail_cache.view(tail_cache.shape[0], tail_cache.shape[1], 2, self.head_dim).permute(
                 0, 2, 1, 3
             )

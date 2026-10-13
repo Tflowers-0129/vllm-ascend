@@ -77,6 +77,30 @@ def view_compressed_indexer_cache(
     )
     strides = _row_major_strides(shape)
     typed_slot = raw_single.view(kv_cache_spec.dtype)
+    if kv_cache_spec.dtype == torch.int8 and kv_cache_spec.scale_dim:
+        # Triton LI C8 stores [INT8 key, FP32 scale] in each row. Split the
+        # scheduler page into equal padded kernel pages, matching block-table
+        # expansion. A5's shared tail-page alignment can pad multi-block pages.
+        row_bytes = kv_cache_spec.head_size + kv_cache_spec.scale_dim * get_dtype_size(kv_cache_spec.scale_dtype)
+        kernel_page_bytes = kv_cache_spec.page_size_bytes // num_blocks_per_kv_block
+        if (
+            kv_cache_spec.num_kv_heads != 1
+            or kv_cache_spec.scale_dim != 1
+            or kv_cache_spec.scale_dtype != torch.float32
+            or raw_single.numel() % kv_cache_spec.page_size_bytes
+            or kv_cache_spec.page_size_bytes % num_blocks_per_kv_block
+            or kernel_page_bytes < indexer_kernel_block_size * row_bytes
+            or kernel_page_bytes % 2
+            or row_bytes % 2
+        ):
+            raise ValueError(f"Compressed INT8 indexer key and scale for {layer_name} do not fit aligned kernel pages.")
+        return (
+            torch.as_strided(
+                typed_slot,
+                size=(*shape[:-1], row_bytes),
+                stride=(kernel_page_bytes, row_bytes, row_bytes, 1),
+            ),
+        )
     if kv_cache_spec.scale_dim:
         # Each kernel block holds a contiguous K region followed by scales.
         # Interleave these regions when one scheduler page contains multiple

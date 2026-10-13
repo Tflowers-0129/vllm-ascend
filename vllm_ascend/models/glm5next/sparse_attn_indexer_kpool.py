@@ -95,8 +95,10 @@ class SparseAttnIndexerKpool(nn.Module):
             )
         if indexer_metadata.cum_query_lens is None or indexer_metadata.raw_seq_lens is None:
             raise ValueError("GLM KPool metadata requires cum_query_lens and raw_seq_lens.")
-        if indexer_cache.dtype != torch.bfloat16:
-            raise TypeError("GLM KPool compressed cache must be bfloat16.")
+        if indexer_cache.dtype not in (torch.bfloat16, torch.int8):
+            raise TypeError("GLM KPool Triton compressed cache must be bfloat16 or int8 (LI C8).")
+        if indexer_cache.dtype == torch.int8 and indexer_cache.shape[-1] != self.head_dim + 4:
+            raise ValueError("GLM KPool LI C8 rows require head_dim INT8 bytes plus one FP32 scale.")
         if tail_cache.dtype != torch.float32 or k.dtype != torch.float32 or gate_score.dtype != torch.float32:
             raise TypeError("GLM KPool keys, gates and compressor tail must be float32.")
         if (

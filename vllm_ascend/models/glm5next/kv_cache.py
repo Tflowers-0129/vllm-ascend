@@ -93,6 +93,8 @@ class Glm5NextIndexerCache(nn.Module, AttentionLayerBase):
             )
         self.head_dim = head_dim
         self.dtype = dtype
+        if dtype not in (torch.bfloat16, torch.int8, torch.float8_e4m3fn):
+            raise ValueError(f"GLM KPool cache requires BF16, INT8 or FP8, got {dtype}.")
         if dtype == torch.float8_e4m3fn:
             if not get_current_hardware_profile().supports(HardwareCapability.POOL_KEY_INDEXER_FP8):
                 raise NotImplementedError("GLM KPool FP8 LI requires CANN PoolKeyIndexer FP8 support on Ascend A5.")
@@ -117,8 +119,8 @@ class Glm5NextIndexerCache(nn.Module, AttentionLayerBase):
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,
-            scale_dim=1 if self.dtype == torch.float8_e4m3fn else 0,
-            scale_dtype=torch.float32 if self.dtype == torch.float8_e4m3fn else torch.int8,
+            scale_dim=1 if self.dtype in (torch.int8, torch.float8_e4m3fn) else 0,
+            scale_dtype=torch.float32 if self.dtype in (torch.int8, torch.float8_e4m3fn) else torch.int8,
             cache_dtype_str=None,
             model_version="glm5_next",
             indexes_kv_by_block_stride=True,
