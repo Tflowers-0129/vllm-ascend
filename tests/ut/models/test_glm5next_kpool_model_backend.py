@@ -11,6 +11,7 @@ from torch import nn
 from vllm.config.compilation import CUDAGraphMode
 
 import vllm_ascend.attention.indexer_kpool as backend_module
+import vllm_ascend.models.glm5next.sparse_attn_indexer_kpool_cann as cann_module
 from vllm_ascend.attention.indexer_kpool import (
     AscendIndexerKPoolMetadata,
     AscendIndexerKPoolQueryMetadata,
@@ -226,6 +227,7 @@ def test_backend_uses_normalized_q_c_and_separate_tail_metadata(
     graph_mode,
     dsa_cp,
 ) -> None:
+    monkeypatch.setattr(backend_module, "enable_dsa_cp", lambda: dsa_cp)
     backend = Glm5NextKPoolIndexerBackend.__new__(Glm5NextKPoolIndexerBackend)
     nn.Module.__init__(backend)
     backend.n_head = 2
@@ -243,11 +245,11 @@ def test_backend_uses_normalized_q_c_and_separate_tail_metadata(
     )
     backend.tail_cache = SimpleNamespace(
         prefix="indexer.tail",
-        kv_cache=torch.zeros(2, 2, 4, 2, dtype=torch.float32),
+        kv_cache=torch.zeros(2, 4, 4, dtype=torch.float32),
     )
     backend.topk_indices_buffer = torch.empty(64, 16, dtype=torch.int32)
     backend.softmax_scale = 0.5
-    backend._wk_weight_f32 = None
+    backend._key_weight = None
     backend.indexer_op = _RecordingKPool()
     tail_metadata = _tail_metadata()
     monkeypatch.setattr(
@@ -267,19 +269,20 @@ def test_backend_uses_normalized_q_c_and_separate_tail_metadata(
     metadata.cum_query_lens = torch.arange(1, 9, dtype=torch.int32)
     metadata.raw_seq_lens = torch.ones(8, dtype=torch.int32)
     metadata.seq_lens = torch.zeros(8, dtype=torch.int32)
-    metadata.seq_lens_cpu = metadata.seq_lens.clone()
     metadata.block_table = torch.zeros(8, 1, dtype=torch.int32)
     metadata.positions = torch.zeros(64, dtype=torch.int64)
     metadata.slot_mapping = torch.full((64,), -1, dtype=torch.int64)
+
     if dsa_cp:
-        metadata.query_metadata = AscendIndexerKPoolQueryMetadata(
+        metadata.query_metadata = backend_module.AscendIndexerKPoolQueryMetadata(
             positions=metadata.positions,
             cum_query_lens=metadata.cum_query_lens,
             num_actual_tokens=metadata.num_actual_tokens,
         )
         metadata.positions = torch.zeros(128, dtype=torch.int64)
-        group = SimpleNamespace(all_gather=lambda x, dim: torch.cat((x, x)))
-        monkeypatch.setattr(backend_module, "get_tp_group", lambda: group)
+        monkeypatch.setattr(
+            backend_module, "get_tp_group", lambda: SimpleNamespace(all_gather=lambda x, dim: torch.cat((x, x)))
+        )
 
     result = backend.forward(
         hidden,
@@ -291,32 +294,35 @@ def test_backend_uses_normalized_q_c_and_separate_tail_metadata(
 
     assert result is not None
     assert backend.indexer_op.args is not None
+    assert backend.indexer_op.kwargs is not None
     expected_rows = 64 if dsa_cp or graph_mode == CUDAGraphMode.FULL else 8
     assert result.shape[0] == expected_rows
     torch.testing.assert_close(
         backend.indexer_op.args[1], normalized_q_c[:expected_rows].repeat(1, 2).view(expected_rows, 2, 2)
     )
-    expected_k = torch.nn.functional.layer_norm(
-        torch.nn.functional.linear(hidden[:expected_rows] + 3, backend.wk_weights_proj.weight)[:, :2],
-        (2,),
-        backend.k_norm.weight,
-        backend.k_norm.bias,
-        backend.k_norm.eps,
-    )
-    torch.testing.assert_close(
-        backend.indexer_op.args[0], torch.cat((expected_k, expected_k)) if dsa_cp else expected_k
-    )
-    assert backend.indexer_op.args[0].dtype == torch.float32
+    if dsa_cp:
+        expected_k = torch.nn.functional.layer_norm(
+            torch.nn.functional.linear(hidden[:expected_rows] + 3, backend.wk_weights_proj.weight)[:, :2],
+            (2,),
+            backend.k_norm.weight,
+            backend.k_norm.bias,
+            backend.k_norm.eps,
+        )
+        torch.testing.assert_close(backend.indexer_op.args[0], torch.cat((expected_k, expected_k)))
+        assert backend.indexer_op.kwargs["query_metadata"] is metadata.query_metadata
+        assert backend.indexer_op.args[5].shape == (2, 2, 4, 2)
+    else:
+        torch.testing.assert_close(backend.indexer_op.args[0], hidden[:expected_rows] + 3)
+        torch.testing.assert_close(backend.indexer_op.kwargs["key_weight"], backend.wk_weights_proj.weight[:2])
+        torch.testing.assert_close(backend.indexer_op.kwargs["norm_weight"], backend.k_norm.weight.float())
+        assert backend.indexer_op.kwargs["norm_eps"] == backend.k_norm.eps
     expected_weights = torch.nn.functional.linear(hidden[:expected_rows], backend.wk_weights_proj.weight[2:]) * (
         0.5 * 2**-0.5
     )
     torch.testing.assert_close(backend.indexer_op.args[2], expected_weights)
     assert backend.indexer_op.args[7] is tail_metadata
-    assert backend.indexer_op.kwargs is not None
     assert backend.indexer_op.kwargs["compute_topk"] is True
     assert backend.indexer_op.kwargs["output_buffer"] is backend.topk_indices_buffer
-    assert backend.indexer_op.kwargs["allow_cache_packing"] is (graph_mode != CUDAGraphMode.FULL)
-    assert backend.indexer_op.kwargs["query_metadata"] is metadata.query_metadata
 
 
 def test_dsacp_kpool_compresses_global_tokens_and_selects_local_queries(monkeypatch):
@@ -352,3 +358,17 @@ def test_dsacp_kpool_compresses_global_tokens_and_selects_local_queries(monkeypa
     assert result.shape[0] == 4
     assert torch.all(result[3] == -1)
     torch.testing.assert_close(result[:3, 0, 0], torch.tensor([0, 0, 0], dtype=torch.int32))
+
+
+@pytest.mark.parametrize("missing", ["cann_ops_transformer", "vllm_ascend.ops.triton.glm5_next_cann_keypool"])
+def test_cann_backend_reports_missing_operator_dependencies(monkeypatch, missing):
+    def load(name):
+        if name == missing:
+            raise ImportError(name)
+        return MagicMock()
+
+    loader = MagicMock(side_effect=load)
+    monkeypatch.setattr(cann_module, "import_module", loader)
+    with pytest.raises(RuntimeError, match="CANN ops-transformer operator package and Triton cache/index adapters"):
+        cann_module.SparseAttnIndexerKpool(4, 2)
+    assert missing in [call.args[0] for call in loader.call_args_list]
