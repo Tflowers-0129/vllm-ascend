@@ -562,7 +562,7 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
             logger.info_once(
                 "KPool indexer LI C8 enabled: dtype=%s, backend=%s, dsa_cp=%s",
                 self.k_cache.dtype,
-                "Triton" if self.k_cache.dtype == torch.int8 else "CANN",
+                "Triton" if enable_dsa_cp() or self.k_cache.dtype == torch.int8 else "CANN",
                 enable_dsa_cp(),
             )
         for name in (
@@ -670,8 +670,6 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
         )
         tail_cache = self._bound_cache(self.tail_cache)
         if use_triton:
-            if indexer_scale_cache is not None:
-                raise NotImplementedError("GLM KPool FP8 LI does not support DSA context parallelism.")
             assert cp_projected is not None and cp_hidden is not None and self._gate_weight_f32 is not None
             k = F.layer_norm(
                 cp_projected[:, : self.head_dim],
@@ -682,7 +680,7 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
             )
             gate_score = F.linear(cp_hidden, self._gate_weight_f32)
             if indexer_metadata.query_metadata is not None:
-                # Gather global K/gate rows before per-rank pooling and INT8
+                # Gather global K/gate rows before per-rank pooling and C8
                 # quantization; top-k continues to use rank-local queries.
                 gathered = get_tp_group().all_gather(torch.cat((k, gate_score), dim=-1), dim=0)
                 k, gate_score = gathered.split(self.head_dim, dim=-1)
@@ -712,6 +710,7 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
                 output_buffer=self.topk_indices_buffer,
                 allow_cache_packing=context.cudagraph_runtime_mode != CUDAGraphMode.FULL,
                 query_metadata=indexer_metadata.query_metadata,
+                indexer_scale_cache=indexer_scale_cache,
             )
         positions = indexer_metadata.positions[:num_tokens]
         result = self.indexer_op(

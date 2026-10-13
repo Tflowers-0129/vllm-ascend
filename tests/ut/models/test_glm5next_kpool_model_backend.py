@@ -153,7 +153,23 @@ def test_triton_indexer_updates_both_caches_and_masks_padding(monkeypatch, compu
     indexer_cache = torch.zeros(2, 2, 1, 2, dtype=torch.bfloat16)
     tail_cache = torch.zeros(2, 2, 4, 2)
 
-    def compress(state, cache, k, gate, ape, positions, query_ends, seq_lens, state_slots, table, indexer_slots, pool):
+    def compress(
+        state,
+        cache,
+        k,
+        gate,
+        ape,
+        positions,
+        query_ends,
+        seq_lens,
+        state_slots,
+        table,
+        indexer_slots,
+        pool,
+        *,
+        indexer_scale_cache=None,
+    ):
+        assert indexer_scale_cache is None
         assert k.dtype == gate.dtype == state.dtype == torch.float32
         assert pool == 4
         torch.testing.assert_close(query_ends, metadata.cum_query_lens)
@@ -266,7 +282,7 @@ class _RecordingKPool(nn.Module):
 
 @pytest.mark.parametrize("graph_mode", [CUDAGraphMode.NONE, CUDAGraphMode.FULL])
 @pytest.mark.parametrize("dsa_cp", [False, True])
-@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.int8])
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.int8, torch.float8_e4m3fn])
 def test_backend_uses_normalized_q_c_and_separate_tail_metadata(
     monkeypatch,
     graph_mode,
@@ -290,6 +306,8 @@ def test_backend_uses_normalized_q_c_and_separate_tail_metadata(
         dtype=cache_dtype,
         kv_cache=torch.zeros(2, 2, 1, 6 if cache_dtype == torch.int8 else 2, dtype=cache_dtype),
     )
+    if cache_dtype == torch.float8_e4m3fn:
+        backend.k_cache.kv_cache = (backend.k_cache.kv_cache, torch.zeros(2, 2, 1, 1))
     backend.tail_cache = SimpleNamespace(
         prefix="indexer.tail",
         kv_cache=torch.zeros(2, 4, 4, dtype=torch.float32),
@@ -366,6 +384,8 @@ def test_backend_uses_normalized_q_c_and_separate_tail_metadata(
         torch.testing.assert_close(backend.indexer_op.kwargs["key_weight"], backend.wk_weights_proj.weight[:2])
         torch.testing.assert_close(backend.indexer_op.kwargs["norm_weight"], backend.k_norm.weight.float())
         assert backend.indexer_op.kwargs["norm_eps"] == backend.k_norm.eps
+    if cache_dtype == torch.float8_e4m3fn:
+        assert backend.indexer_op.kwargs["indexer_scale_cache"] is backend.k_cache.kv_cache[1]
     expected_weights = torch.nn.functional.linear(hidden[:expected_rows], backend.wk_weights_proj.weight[2:]) * (
         0.5 * 2**-0.5
     )
@@ -375,7 +395,7 @@ def test_backend_uses_normalized_q_c_and_separate_tail_metadata(
     assert backend.indexer_op.kwargs["output_buffer"] is backend.topk_indices_buffer
 
 
-@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.int8])
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.int8, torch.float8_e4m3fn])
 def test_dsacp_kpool_compresses_global_tokens_and_selects_local_queries(monkeypatch, cache_dtype):
     metadata = _indexer_metadata()
     local_positions = metadata.positions[4:]
@@ -386,6 +406,7 @@ def test_dsacp_kpool_compresses_global_tokens_and_selects_local_queries(monkeypa
     select = MagicMock(return_value=torch.zeros((4, 1, 7), dtype=torch.int32))
     monkeypatch.setattr(kpool_module, "glm5_next_kpool_tail_compress_and_write_cache_triton", compress)
     monkeypatch.setattr(kpool_module, "glm5_next_lightning_indexer_triton", select)
+    scales = torch.ones(2, 2, 1, 1) if cache_dtype == torch.float8_e4m3fn else None
     result = SparseAttnIndexerKpool(4, 2)(
         torch.zeros(8, 2),
         torch.zeros(4, 1, 2, dtype=torch.bfloat16),
@@ -401,11 +422,14 @@ def test_dsacp_kpool_compresses_global_tokens_and_selects_local_queries(monkeypa
         max_pool_seq_len=1,
         compute_topk=True,
         query_metadata=query_metadata,
+        indexer_scale_cache=scales,
     )
     assert compress.call_args.args[2].shape[0] == 8
     assert compress.call_args.args[6] is metadata.cum_query_lens
     assert select.call_args.args[3] is query_metadata.cum_query_lens
     assert select.call_args.args[6] is local_positions
+    assert compress.call_args.kwargs["indexer_scale_cache"] is scales
+    assert select.call_args.kwargs["indexer_scale_cache"] is scales
     assert result.shape[0] == 4
     assert torch.all(result[3] == -1)
     torch.testing.assert_close(result[:3, 0, 0], torch.tensor([0, 0, 0], dtype=torch.int32))

@@ -39,6 +39,7 @@ def _glm5_next_kpool_tail_compress_kernel(
     tail_cache_ptr,
     indexer_cache_ptr,
     c8_cache_ptr,
+    scale_cache_ptr,
     k_ptr,
     gate_score_ptr,
     ape_ptr,
@@ -59,6 +60,8 @@ def _glm5_next_kpool_tail_compress_kernel(
     indexer_cache_stride_block: tl.constexpr,
     indexer_cache_stride_offset: tl.constexpr,
     indexer_cache_stride_d: tl.constexpr,
+    scale_cache_stride_block: tl.constexpr,
+    scale_cache_stride_offset: tl.constexpr,
     tail_block_table_stride_req: tl.constexpr,
     indexer_num_slots: tl.constexpr,
     tail_num_blocks: tl.constexpr,
@@ -72,6 +75,7 @@ def _glm5_next_kpool_tail_compress_kernel(
     BLOCK_D: tl.constexpr,
     QUANT_MODE: tl.constexpr,
     QUANT_MAX: tl.constexpr,
+    PLANAR_SCALES: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
     dim_offsets = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
@@ -194,15 +198,26 @@ def _glm5_next_kpool_tail_compress_kernel(
                 quantized,
                 mask=dim_mask & indexer_valid,
             )
-            scale_bits = tl.where(abs_max > 0, scale, 0.0).to(tl.int32, bitcast=True)
-            byte_base = (
-                c8_cache_ptr
-                + indexer_block * indexer_cache_stride_block
-                + indexer_offset * indexer_cache_stride_offset
-                + HEAD_DIM * indexer_cache_stride_d
-            )
-            for i in tl.static_range(4):
-                tl.store(byte_base + i, ((scale_bits >> (8 * i)) & 0xFF).to(tl.int8), mask=indexer_valid)
+            stored_scale = tl.where(abs_max > 0, scale, 0.0)
+            if PLANAR_SCALES:
+                # Preserve CANN's FP8 key/FP32 scale planes for P/D transfer.
+                tl.store(
+                    scale_cache_ptr
+                    + indexer_block * scale_cache_stride_block
+                    + indexer_offset * scale_cache_stride_offset,
+                    stored_scale,
+                    mask=indexer_valid,
+                )
+            else:
+                scale_bits = stored_scale.to(tl.int32, bitcast=True)
+                byte_base = (
+                    c8_cache_ptr
+                    + indexer_block * indexer_cache_stride_block
+                    + indexer_offset * indexer_cache_stride_offset
+                    + HEAD_DIM * indexer_cache_stride_d
+                )
+                for i in tl.static_range(4):
+                    tl.store(byte_base + i, ((scale_bits >> (8 * i)) & 0xFF).to(tl.int8), mask=indexer_valid)
 
 
 @triton.jit(do_not_specialize=["num_tokens"])
@@ -260,6 +275,8 @@ def glm5_next_kpool_tail_compress_and_write_cache_triton(
     tail_block_table: torch.Tensor,
     indexer_slot_mapping: torch.Tensor,
     index_kpool: int,
+    *,
+    indexer_scale_cache: torch.Tensor | None = None,
 ) -> None:
     """Compress from old tail + current input, then seed unique circular slots.
 
@@ -312,7 +329,17 @@ def glm5_next_kpool_tail_compress_and_write_cache_triton(
         raise NotImplementedError(
             f"KPool LI C8 requires one dim program per row: head_dim={head_dim}, block_d={block_d}."
         )
-    if indexer_cache.ndim != 4 or indexer_cache.shape[3] != head_dim + (LI_C8_SCALE_BYTES if quant_mode else 0):
+    planar_scales = indexer_scale_cache is not None
+    if planar_scales and (
+        quant_mode != 2
+        or indexer_scale_cache.dtype != torch.float32
+        or indexer_scale_cache.device != indexer_cache.device
+        or indexer_scale_cache.shape != (*indexer_cache.shape[:-1], 1)
+        or indexer_scale_cache.stride(-1) != 1
+    ):
+        raise ValueError("KPool FP8 keys require matching FP32 scale planes on the cache device.")
+    row_width = head_dim + (LI_C8_SCALE_BYTES if quant_mode and not planar_scales else 0)
+    if indexer_cache.ndim != 4 or indexer_cache.shape[3] != row_width:
         raise ValueError(
             f"KPool indexer cache rows of {indexer_cache.dtype} do not match head_dim={head_dim}: "
             f"shape={tuple(indexer_cache.shape)}."
@@ -322,6 +349,7 @@ def glm5_next_kpool_tail_compress_and_write_cache_triton(
         tail_cache,
         indexer_cache,
         indexer_cache.view(torch.int8) if quant_mode != 0 else indexer_cache,
+        indexer_scale_cache if planar_scales else indexer_cache,
         k,
         gate_score,
         ape,
@@ -342,6 +370,8 @@ def glm5_next_kpool_tail_compress_and_write_cache_triton(
         indexer_cache.stride(0),
         indexer_cache.stride(1),
         indexer_cache.stride(3),
+        indexer_scale_cache.stride(0) if planar_scales else 0,
+        indexer_scale_cache.stride(1) if planar_scales else 0,
         tail_block_table.stride(0),
         indexer_cache.shape[0] * indexer_cache.shape[1],
         tail_cache.shape[0],
@@ -355,6 +385,7 @@ def glm5_next_kpool_tail_compress_and_write_cache_triton(
         block_d,
         quant_mode,
         quant_max,
+        planar_scales,
     )
     _store_kpool_tail_kernel[(num_reqs * tail_cache.shape[2], triton.cdiv(head_dim, block_d))](
         tail_cache,
