@@ -234,7 +234,8 @@ def test_indexer_metadata_addresses_complete_storage_pages(storage_block_size):
     torch.testing.assert_close(draft.block_table, common.block_table_tensor[:1])
 
 
-def test_dsacp_indexer_shards_queries_and_keeps_global_cache_metadata(monkeypatch):
+@pytest.mark.parametrize("indexer_dtype", ["auto", "int8", "fp8"])
+def test_dsacp_indexer_shards_queries_and_keeps_global_cache_metadata(monkeypatch, indexer_dtype):
     monkeypatch.setattr("vllm_ascend.attention.indexer_kpool.enable_dsa_cp", lambda: True)
     monkeypatch.setattr(
         "vllm_ascend.attention.indexer_kpool.get_tp_group",
@@ -243,6 +244,7 @@ def test_dsacp_indexer_shards_queries_and_keeps_global_cache_metadata(monkeypatc
     config = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=128),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=5, max_num_seqs=2),
+        attention_config=SimpleNamespace(indexer_kv_dtype=indexer_dtype),
         model_config=SimpleNamespace(max_model_len=256),
     )
     spec = AscendMLAAttentionSpec(
@@ -287,9 +289,15 @@ def test_dsacp_indexer_shards_queries_and_keeps_global_cache_metadata(monkeypatc
     assert query.positions.tolist() == [3, 0, 0]
     assert query.cum_query_lens.tolist() == [1, 2]
     assert tail.slot_mapping.tolist() == [0, 1, 2, 3, 128, -1]
+    assert query.seq_lens.tolist() == [1, 0]
+    assert query.pool_tail.tolist() == [0, 1]
+    assert (metadata.keypool_state_table is not None) == (indexer_dtype == "fp8")
+    assert (tail.cann_inputs is not None) == (indexer_dtype == "fp8")
     refreshed = builder.build(0, common).query_metadata
     assert refreshed.cum_query_lens.data_ptr() == query.cum_query_lens.data_ptr()
     assert refreshed.positions.data_ptr() == query.positions.data_ptr()
+    assert refreshed.seq_lens.data_ptr() == query.seq_lens.data_ptr()
+    assert refreshed.pool_tail.data_ptr() == query.pool_tail.data_ptr()
     assert tail_builder.build(0, common).slot_mapping.data_ptr() == tail.slot_mapping.data_ptr()
 
 
@@ -301,7 +309,6 @@ def test_model_cache_layers_publish_source_compatible_specs(dtype):
     )
     cache_config = SimpleNamespace(block_size=256)
     with (
-        patch("vllm_ascend.models.glm5next.kv_cache.enable_dsa_cp", return_value=False),
         patch("vllm_ascend.models.glm5next.kv_cache.get_current_hardware_profile"),
         patch(
             "vllm_ascend.models.glm5next.kv_cache.get_current_vllm_config",

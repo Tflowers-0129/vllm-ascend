@@ -90,7 +90,12 @@ def test_backend_selects_cache_compatible_operator(monkeypatch, dsa_cp, cache_dt
         topk_indices_buffer=None,
     )
     backend = Glm5NextKPoolIndexerBackend(source, qk_rope_head_dim=0)
-    assert backend.indexer_op is (triton_op if dsa_cp or cache_dtype == torch.int8 else cann_op).return_value
+    assert (
+        backend.indexer_op
+        is (
+            triton_op if cache_dtype == torch.int8 or (dsa_cp and cache_dtype != torch.float8_e4m3fn) else cann_op
+        ).return_value
+    )
     assert backend.num_cache_tensors == (2 if cache_dtype == torch.float8_e4m3fn else 1)
     assert backend.enable_sparse_li_c8 == (cache_dtype != torch.bfloat16)
 
@@ -365,7 +370,7 @@ def test_backend_uses_normalized_q_c_and_separate_tail_metadata(
     torch.testing.assert_close(
         backend.indexer_op.args[1], normalized_q_c[:expected_rows].repeat(1, 2).view(expected_rows, 2, 2)
     )
-    if dsa_cp or cache_dtype == torch.int8:
+    if cache_dtype == torch.int8 or (dsa_cp and cache_dtype != torch.float8_e4m3fn):
         expected_k = torch.nn.functional.layer_norm(
             torch.nn.functional.linear(hidden[:expected_rows] + 3, backend.wk_weights_proj.weight)[:, :2],
             (2,),
@@ -380,12 +385,15 @@ def test_backend_uses_normalized_q_c_and_separate_tail_metadata(
         assert backend.indexer_op.args[5].shape == (2, 2, 4, 2)
         assert backend.indexer_op.args[4].dtype == cache_dtype
     else:
-        torch.testing.assert_close(backend.indexer_op.args[0], hidden[:expected_rows] + 3)
+        expected_hidden = hidden[:expected_rows] + 3
+        torch.testing.assert_close(
+            backend.indexer_op.args[0], torch.cat((expected_hidden, expected_hidden)) if dsa_cp else expected_hidden
+        )
+        if cache_dtype == torch.float8_e4m3fn:
+            assert backend.indexer_op.kwargs["indexer_scale_cache"] is backend.k_cache.kv_cache[1]
         torch.testing.assert_close(backend.indexer_op.kwargs["key_weight"], backend.wk_weights_proj.weight[:2])
         torch.testing.assert_close(backend.indexer_op.kwargs["norm_weight"], backend.k_norm.weight.float())
         assert backend.indexer_op.kwargs["norm_eps"] == backend.k_norm.eps
-    if cache_dtype == torch.float8_e4m3fn:
-        assert backend.indexer_op.kwargs["indexer_scale_cache"] is backend.k_cache.kv_cache[1]
     expected_weights = torch.nn.functional.linear(hidden[:expected_rows], backend.wk_weights_proj.weight[2:]) * (
         0.5 * 2**-0.5
     )
