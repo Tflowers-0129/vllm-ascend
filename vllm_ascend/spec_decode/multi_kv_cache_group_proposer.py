@@ -223,12 +223,20 @@ class AscendMultiKVCacheGroupMTPProposer(AscendEagleProposer):
         slot_mapping_lens = self.slot_mapping_group[0].shape[0]
         self._mtp_num_actual_reqs = torch.zeros((), dtype=torch.int32, device=self.device)
         self._multi_group_slot_mapping_buffers: dict[tuple[int, int], torch.Tensor] = {}
+        self._multi_group_block_table_buffers: dict[tuple[int, int], torch.Tensor] = {}
         for attn_group in self.draft_attn_groups:
             gid = attn_group.kv_cache_group_id
             if gid == self.kv_cache_gid:
                 # The primary group reuses the proposer's per-step buffers.
                 continue
+            block_table_width = self._draft_block_table_width(attn_group)
             for draft_index in range(self.num_speculative_tokens):
+                self._multi_group_block_table_buffers[(gid, draft_index)] = torch.zeros(
+                    (slot_mapping_lens, block_table_width),
+                    dtype=torch.int32,
+                    device=self.device,
+                    pin_memory=self.runner.pin_memory,
+                )
                 self._multi_group_slot_mapping_buffers[(gid, draft_index)] = torch.zeros(
                     slot_mapping_lens,
                     dtype=torch.int32,
@@ -289,12 +297,22 @@ class AscendMultiKVCacheGroupMTPProposer(AscendEagleProposer):
             block_table = self.runner.input_batch.block_table[gid]
             num_reqs = group_metadata.num_reqs
             num_actual_tokens = common_attn_metadata.num_actual_tokens
+            block_table_tensor = block_table.get_device_tensor()
+            source_num_reqs = min(num_reqs, block_table_tensor.shape[0])
             block_table.compute_slot_mapping(
-                num_reqs,
+                source_num_reqs,
                 common_attn_metadata.query_start_loc,
                 common_attn_metadata.positions[:num_actual_tokens],
             )
-            block_table_tensor = block_table.get_device_tensor()[:num_reqs]
+            block_table_tensor = block_table_tensor[:source_num_reqs, : self._draft_block_table_width(attn_group)]
+            if source_num_reqs < num_reqs:
+                # Existing GLM53 repair: FULL buckets may exceed max_num_seqs.
+                # Preallocated tables keep graph capture/replay addresses fixed.
+                padded_table = self._multi_group_block_table_buffers[(gid, draft_index)][:num_reqs]
+                assert padded_table.shape[0] == num_reqs
+                padded_table.zero_()
+                padded_table[:source_num_reqs].copy_(block_table_tensor)
+                block_table_tensor = padded_table
             # Pre-created in ``initialize_attn_backend``; never allocate here so
             # the address an ACL graph captured stays valid across replays.
             group_slot_mapping = self._multi_group_slot_mapping_buffers.get((gid, draft_index))
