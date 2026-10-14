@@ -27,9 +27,9 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm_ascend.core.kv_cache_interface import AscendIndexerKPoolTailSpec, get_kv_cache_compression_ratio
 
 from vllm_ascend.attention.indexer_kpool import GLM5_NEXT_SFA_KERNEL_BLOCK_SIZE
-from vllm_ascend.core.kv_cache_interface import AscendIndexerKPoolTailSpec, get_kv_cache_compression_ratio
 
 
 @dataclass(frozen=True)

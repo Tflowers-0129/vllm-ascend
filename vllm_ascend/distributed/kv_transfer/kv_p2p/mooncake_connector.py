@@ -56,8 +56,6 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.request import RequestStatus
-
-from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec, AscendSlidingWindowMLASpec
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 from vllm_ascend.distributed.kv_transfer.utils.utils import (
@@ -80,6 +78,8 @@ from vllm_ascend.utils import (
     model_uses_sfa_sparse,
     vllm_version_is,
 )
+
+from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 
 # isort: off
 if TYPE_CHECKING:
@@ -955,9 +955,7 @@ class KVCacheRecvingThread(threading.Thread):
                 # Preserve same-layout compatibility with peers predating the
                 # explicit Mamba metadata fields.
                 remote_mamba_mode = remote_mamba_spec.get("mamba_cache_mode", self.mamba_cache_mode)
-                remote_speculative_blocks = remote_mamba_spec.get(
-                    "num_speculative_blocks", self.num_speculative_tokens
-                )
+                remote_speculative_blocks = remote_mamba_spec.get("num_speculative_blocks", self.num_speculative_tokens)
                 if remote_mamba_mode not in (None, "align", "none"):
                     raise RuntimeError(f"Unsupported remote Mamba cache mode: {remote_mamba_mode}")
                 if not isinstance(remote_speculative_blocks, int) or remote_speculative_blocks < 0:
@@ -1241,9 +1239,7 @@ class KVCacheRecvingThread(threading.Thread):
             _transpose_cache_by_block(v_cache_layer)
 
     @staticmethod
-    def _validate_mamba_transfer_layout(
-        local_spec: dict[str, Any], remote_spec: dict[str, Any], tp_ratio: int
-    ) -> None:
+    def _validate_mamba_transfer_layout(local_spec: dict[str, Any], remote_spec: dict[str, Any], tp_ratio: int) -> None:
         """Reject incompatible state storage before issuing any remote read."""
         local_shapes = local_spec.get("shapes", [])
         remote_shapes = remote_spec.get("shapes", [])
@@ -2495,9 +2491,11 @@ class MooncakeConnectorWorker:
                     next_mtp_layer_idx += 1
                 elif model_type in ("glm5_next", "glm5_next_text") and layer_name.endswith(".indexer.tail_cache"):
                     layer_idx = 2 * index_cache_plane_base + extract_layer_index(layer_name, num_attn_module)
-                elif model_type in ("glm5_next", "glm5_next_text") and layer_name.endswith(".indexer.k_cache"):
-                    layer_idx = index_cache_plane_base + extract_layer_index(layer_name, num_attn_module)
-                elif self._is_index_cache_layer(layer_name):
+                elif (
+                    model_type in ("glm5_next", "glm5_next_text")
+                    and layer_name.endswith(".indexer.k_cache")
+                    or self._is_index_cache_layer(layer_name)
+                ):
                     layer_idx = index_cache_plane_base + extract_layer_index(layer_name, num_attn_module)
                 else:
                     layer_idx = extract_layer_index(layer_name, num_attn_module)

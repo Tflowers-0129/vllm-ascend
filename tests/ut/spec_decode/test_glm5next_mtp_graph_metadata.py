@@ -146,6 +146,7 @@ def test_graph_metadata_reads_persistent_tables_and_keeps_group_slots_separate(m
     class Table:
         def __init__(self, size, ids, width):
             self.size = size
+            self.is_circular_group = False
             self.data = torch.tensor(ids, dtype=torch.int32)[:, None].expand(2, width).clone()
             self.slot_mapping = SimpleNamespace(gpu=torch.full((64,), -1, dtype=torch.int32))
 
@@ -161,6 +162,10 @@ def test_graph_metadata_reads_persistent_tables_and_keeps_group_slots_separate(m
                 )
 
     proposer.runner.input_batch.block_table.extend([Table(32, [9, 19], 8), Table(256, [11, 12], 1)])
+    proposer._multi_group_block_table_buffers = {
+        gid: torch.empty_like(table.get_device_tensor())
+        for gid, table in enumerate(proposer.runner.input_batch.block_table)
+    }
     for gid in (1, 2):
         builder = SimpleNamespace(build_for_drafting=lambda common, step: common)
         proposer.draft_attn_groups.append(

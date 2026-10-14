@@ -4,11 +4,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm_ascend.core.kv_cache_interface import AscendIndexerKPoolTailSpec, AscendMLAAttentionSpec
+from vllm_ascend.utils import vllm_version_is
 
 from vllm_ascend.attention.indexer_kpool import AscendIndexerKPoolMetadataBuilder, AscendIndexerKPoolTailMetadataBuilder
-from vllm_ascend.core.kv_cache_interface import AscendIndexerKPoolTailSpec, AscendMLAAttentionSpec
 from vllm_ascend.spec_decode.multi_kv_cache_group_proposer import AscendMultiKVCacheGroupMTPProposer
-from vllm_ascend.utils import vllm_version_is
 
 
 @pytest.fixture(autouse=True)
@@ -140,7 +140,9 @@ def test_mtp_preserves_expanded_kernel_pages(logical, primary):
     proposer.vllm_config = config
     gid = 0 if primary else 1
     proposer._multi_group_slot_mapping_buffers = {(gid, 0): common.slot_mapping.clone()}
+    proposer._multi_group_block_table_buffers = {gid: torch.empty_like(table)}
     cache = SimpleNamespace(
+        is_circular_group=False,
         compute_slot_mapping=lambda *_: None,
         get_device_tensor=lambda: table,
         slot_mapping=SimpleNamespace(gpu=common.slot_mapping),

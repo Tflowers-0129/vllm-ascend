@@ -42,9 +42,6 @@ from vllm.v1.spec_decode.utils import (
 )
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
-
-from vllm_ascend import utils as ascend_utils
-from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_ascend_forward_context
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
@@ -69,6 +66,9 @@ from vllm_ascend.spec_decode.utils import (
 )
 from vllm_ascend.utils import _is_glm_model, check_gdn_layer, enable_sp, lmhead_tp_enable, use_updatable_graph
 from vllm_ascend.worker.device_metadata import DeviceMetadataTask, DeviceMetadataTaskProvider
+
+from vllm_ascend import utils as ascend_utils
+from vllm_ascend.ascend_config import get_ascend_config
 
 
 class _HiddenStateDrafter(Protocol):

@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GLM-Next cache specs and compressed-cache addressing."""
 
-import sys
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -11,14 +10,6 @@ import pytest
 import torch
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
-
-import vllm_ascend.attention.indexer_kpool as backend_module
-from vllm_ascend.attention.indexer_kpool import (
-    AscendIndexerKPoolBackend,
-    AscendIndexerKPoolMetadataBuilder,
-    AscendIndexerKPoolTailBackend,
-    AscendIndexerKPoolTailMetadataBuilder,
-)
 from vllm_ascend.core.kv_cache_interface import (
     AscendIndexerKPoolTailSpec,
     AscendMLAAttentionSpec,
@@ -26,6 +17,14 @@ from vllm_ascend.core.kv_cache_interface import (
     get_storage_block_size,
     is_prefix_cacheable,
     register_ascend_kv_cache_specs,
+)
+
+import vllm_ascend.attention.indexer_kpool as backend_module
+from vllm_ascend.attention.indexer_kpool import (
+    AscendIndexerKPoolBackend,
+    AscendIndexerKPoolMetadataBuilder,
+    AscendIndexerKPoolTailBackend,
+    AscendIndexerKPoolTailMetadataBuilder,
 )
 from vllm_ascend.models.glm5next.kv_cache import (
     Glm5NextIndexerCache,
@@ -51,7 +50,8 @@ def keypool_kernels(monkeypatch):
         build_keypool_metadata=MagicMock(side_effect=metadata),
         build_tail_inputs=MagicMock(),
     )
-    monkeypatch.setitem(sys.modules, "vllm_ascend.ops.triton.glm5_next_cann_keypool", kernels)
+    monkeypatch.setattr("vllm_ascend.ops.cann_keypool.build_keypool_metadata", kernels.build_keypool_metadata)
+    monkeypatch.setattr("vllm_ascend.ops.cann_keypool.build_tail_inputs", kernels.build_tail_inputs)
     return kernels
 
 
@@ -264,7 +264,6 @@ def test_model_cache_layers_publish_source_compatible_specs(dtype):
     )
     cache_config = SimpleNamespace(block_size=256)
     with (
-        patch("vllm_ascend.models.glm5next.kv_cache.enable_dsa_cp", return_value=False),
         patch("vllm_ascend.models.glm5next.kv_cache.get_current_hardware_profile"),
         patch(
             "vllm_ascend.models.glm5next.kv_cache.get_current_vllm_config",
@@ -605,4 +604,3 @@ def test_fp8_indexer_cache_rejects_unsupported_hardware():
             prefix="indexer.k_cache",
             compress_ratio=4,
         )
-

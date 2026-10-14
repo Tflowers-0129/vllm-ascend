@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from importlib import import_module
 from typing import TYPE_CHECKING
 
@@ -63,8 +64,10 @@ class SparseAttnIndexerKpool(nn.Module):
         compute_topk: bool,
         output_buffer: torch.Tensor | None = None,
         indexer_scale_cache: torch.Tensor | None = None,
+        skip_empty_cp_scoring: bool = True,
     ) -> torch.Tensor | None:
-        num_tokens = hidden_states.shape[0]
+        query_metadata = indexer_metadata.query_metadata
+        num_tokens = hidden_states.shape[0] if query_metadata is None else query_metadata.positions.shape[0]
         output_width = self.topk_tokens + index_kpool - 1
         if compute_topk and output_buffer is not None:
             if (
@@ -79,7 +82,7 @@ class SparseAttnIndexerKpool(nn.Module):
                 raise ValueError("GLM KPool output buffer must cover the token rows and top-k width.")
         if index_kpool <= 0 or self.topk_tokens <= 0 or self.topk_tokens % index_kpool:
             raise ValueError("KPool top-k must be divisible by its positive pool size.")
-        if num_tokens == 0:
+        if hidden_states.shape[0] == 0:
             if not compute_topk:
                 return None
             if output_buffer is not None:
@@ -153,6 +156,36 @@ class SparseAttnIndexerKpool(nn.Module):
         if not compute_topk:
             return None
         assert q_values is not None and weights is not None
+        score_metadata = indexer_metadata
+        if query_metadata is not None:
+            if query_metadata.seq_lens is None or query_metadata.pool_tail is None:
+                raise ValueError("CANN KPool CP requires rank-local causal key lengths and pool tails.")
+            if q_values.shape[0] != num_tokens or weights.shape[0] != num_tokens:
+                raise ValueError("CANN KPool CP query tensors must match the local query metadata.")
+            score_metadata = replace(
+                indexer_metadata,
+                positions=query_metadata.positions,
+                cum_query_lens=query_metadata.cum_query_lens.to(indexer_metadata.cum_query_lens.dtype),
+                seq_lens=query_metadata.seq_lens,
+                pool_tail=query_metadata.pool_tail,
+                num_actual_tokens=query_metadata.num_actual_tokens,
+            )
+        if num_tokens == 0:
+            if output_buffer is not None:
+                return output_buffer[:0, :output_width].unsqueeze(1)
+            return torch.empty((0, 1, output_width), dtype=torch.int32, device=hidden_states.device)
+        # DP padding can leave an entire CP rank without actual queries.
+        # Global KPool cache updates above must still run on every TP rank.
+        # PoolKeyIndexer must not receive a nonempty query allocation with
+        # all-zero actual_seq_q/actual_seq_k. Keep padded result rows invalid.
+        # FULL graph capture must retain the operator for changing replay data.
+        if skip_empty_cp_scoring and query_metadata is not None and query_metadata.num_actual_tokens == 0:
+            if output_buffer is None:
+                output = torch.empty((num_tokens, output_width), dtype=torch.int32, device=hidden_states.device)
+            else:
+                output = output_buffer[:num_tokens, :output_width]
+            output.fill_(-1)
+            return output.unsqueeze(1)
         if quantized:
             query, q_descale = self._quantize_keypool_query(q_values)
             assert indexer_scale_cache is not None
@@ -164,9 +197,9 @@ class SparseAttnIndexerKpool(nn.Module):
             query,
             indexer_cache,
             weights.to(torch.bfloat16),
-            indexer_metadata.pool_tail,
-            actual_seq_q=indexer_metadata.cum_query_lens,
-            actual_seq_k=indexer_metadata.seq_lens,
+            score_metadata.pool_tail,
+            actual_seq_q=score_metadata.cum_query_lens,
+            actual_seq_k=score_metadata.seq_lens,
             block_table=indexer_metadata.block_table,
             layout_q="TND",
             layout_k="PA_BBND",
@@ -175,4 +208,4 @@ class SparseAttnIndexerKpool(nn.Module):
             mask_mode=3,
             **quant_kwargs,
         )
-        return self._pack_keypool_indices(indices, indexer_metadata, self.topk_tokens, index_kpool, output_buffer)
+        return self._pack_keypool_indices(indices, score_metadata, self.topk_tokens, index_kpool, output_buffer)

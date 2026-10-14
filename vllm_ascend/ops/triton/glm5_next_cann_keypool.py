@@ -6,11 +6,14 @@ from types import SimpleNamespace
 
 from vllm.triton_utils import tl, triton
 
+FP8_E4M3_MAX: tl.constexpr = 448.0
+
 
 @triton.jit(do_not_specialize=["tail_rows", "tail_blocks", "cache_blocks", "INPUT_STRIDE", "INPUT_WIDTH"])
 def _write_keypool_caches_kernel(
     tail,
     cache,
+    scale_cache,
     key,
     gate,
     pooled,
@@ -26,10 +29,12 @@ def _write_keypool_caches_kernel(
     cache_blocks,
     BLOCK_SIZE: tl.constexpr,
     CACHE_STRIDE: tl.constexpr,
+    SCALE_STRIDE: tl.constexpr,
     POOLED_STRIDE: tl.constexpr,
     INPUT_STRIDE,
     INPUT_WIDTH,
     SPECULATIVE: tl.constexpr,
+    QUANTIZED: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -53,19 +58,23 @@ def _write_keypool_caches_kernel(
         slot = tl.load(slots + pool_row).to(tl.int64)
         valid = (slot >= 0) & (slot < cache_blocks * BLOCK_SIZE)
         pool_value = tl.load(pooled + pool_row * POOLED_STRIDE + cols, valid & (cols < HEAD_DIM), other=0)
+        if QUANTIZED:
+            pool_value = pool_value.to(tl.float32)
+            maximum = tl.max(tl.abs(pool_value), 0)
+            scale = tl.where(maximum > 0, maximum / FP8_E4M3_MAX, 1.0)
+            pool_value = pool_value / scale
+            tl.store(scale_cache + slot // BLOCK_SIZE * SCALE_STRIDE + slot % BLOCK_SIZE, scale, valid)
         address = cache + slot // BLOCK_SIZE * CACHE_STRIDE + slot % BLOCK_SIZE * HEAD_DIM + cols
         tl.store(address, pool_value, valid & (cols < HEAD_DIM))
 
 
-def write_keypool_caches(tail, cache, key, gate, pooled, metadata, tail_metadata, state):
+def write_keypool_caches(tail, cache, key, gate, pooled, metadata, tail_metadata, state, scale_cache=None):
     inputs = tail_metadata.cann_inputs
     writes = inputs.write_indices
-    tail_rows = writes.numel()
-    pooled_rows = pooled.shape[0]
-    # Each program writes one row: tail rows first, then pooled rows.
-    _write_keypool_caches_kernel[(tail_rows + pooled_rows,)](
+    _write_keypool_caches_kernel[(writes.numel() + pooled.shape[0],)](
         tail,
         cache,
+        scale_cache,
         key,
         gate,
         pooled,
@@ -73,7 +82,7 @@ def write_keypool_caches(tail, cache, key, gate, pooled, metadata, tail_metadata
         inputs.state_indices,
         state,
         metadata.pooled_slot_mapping,
-        tail_rows,
+        writes.numel(),
         cache.shape[-1],
         inputs.page_rows,
         tail.shape[0],
@@ -81,10 +90,12 @@ def write_keypool_caches(tail, cache, key, gate, pooled, metadata, tail_metadata
         cache.shape[0],
         cache.shape[1],
         cache.stride(0),
+        scale_cache.stride(0) if scale_cache is not None else 0,
         pooled.stride(0),
         writes.stride(0),
         writes.shape[1],
         key is not None,
+        scale_cache is not None,
         triton.next_power_of_2(2 * cache.shape[-1]),
     )
 

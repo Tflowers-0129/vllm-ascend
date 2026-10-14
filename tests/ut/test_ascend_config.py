@@ -25,12 +25,14 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import PropertyMock, patch
 
+from tests.ut.base import TestBase
+from tests.ut.kvpp_utils import make_kvpp_config
 from vllm.config import DeviceConfig, KVTransferConfig
 from vllm.config import VllmConfig as _VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm_ascend.device.hardware import AscendDeviceType
+from vllm_ascend.utils import clear_enable_sp, enable_dsa_cp, enable_sp, shared_expert_dp_enabled
 
-from tests.ut.base import TestBase
-from tests.ut.kvpp_utils import make_kvpp_config
 from vllm_ascend.ascend_config import (
     AscendCompilationConfig,
     AscendConfig,
@@ -52,9 +54,7 @@ from vllm_ascend.ascend_config import (
     init_ascend_config,
     is_mega_moe_supported,
 )
-from vllm_ascend.device.hardware import AscendDeviceType
 from vllm_ascend.device.hardware_profile import get_hardware_profile
-from vllm_ascend.utils import clear_enable_sp, enable_dsa_cp, enable_sp, shared_expert_dp_enabled
 
 
 def VllmConfig(*args: Any, **kwargs: Any) -> _VllmConfig:
@@ -1983,51 +1983,6 @@ class TestTopLevelSwitchTypeValidation(TestBase):
         self.assertTrue(config.enable_sparse_sfa_c8)
 
     @_clean_up
-    @patch("vllm_ascend.utils.model_uses_sfa_sparse")
-    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
-    def test_c8_reshape_optim_is_initialized_from_sfa_li_c8_and_pd_role(
-        self,
-        mock_fix,
-        mock_uses_sfa,
-    ):
-        cases = (
-            (None, True, True, "kv_producer", True),
-            (False, True, True, "kv_producer", False),
-            (True, False, True, "kv_producer", False),
-            (True, True, False, "kv_producer", False),
-            (True, True, True, "kv_consumer", False),
-            (True, True, True, "kv_both", False),
-            (True, True, True, None, False),
-        )
-        for reshape_optim, uses_sfa, enable_li_c8, kv_role, expected in cases:
-            with self.subTest(
-                reshape_optim=reshape_optim,
-                uses_sfa=uses_sfa,
-                enable_li_c8=enable_li_c8,
-                kv_role=kv_role,
-            ):
-                mock_uses_sfa.return_value = uses_sfa
-                vc = VllmConfig()
-                vc.additional_config = {
-                    "refresh": True,
-                    "enable_sparse_li_c8": enable_li_c8,
-                }
-                if reshape_optim is not None:
-                    vc.additional_config["c8_enable_reshape_optim"] = reshape_optim
-                # enable_sparse_li_c8 is derived from indexer_kv_dtype (see
-                # init_ascend_config); the per-case flag is expressed there.
-                vc.attention_config.indexer_kv_dtype = "int8" if enable_li_c8 else "auto"
-                if kv_role is not None:
-                    vc.kv_transfer_config = KVTransferConfig(
-                        kv_connector="MooncakeConnectorV1",
-                        kv_role=kv_role,
-                    )
-
-                config = init_ascend_config(vc)
-
-                self.assertEqual(config.c8_reshape_optim_enabled, expected)
-
-    @_clean_up
     @patch("vllm_ascend.utils.model_uses_kpool_indexer", return_value=True)
     @patch("vllm_ascend.utils.model_uses_sfa_sparse", return_value=False)
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
@@ -2210,9 +2165,9 @@ class TestKVPPConfig(TestBase):
     def test_graph_modes(self):
         from types import SimpleNamespace
 
+        from tests.ut.kvpp_utils import make_kvpp_config
         from vllm.config import CUDAGraphMode
 
-        from tests.ut.kvpp_utils import make_kvpp_config
         from vllm_ascend.ascend_config import KVPPConfig
 
         for mode in CUDAGraphMode:
@@ -2229,9 +2184,8 @@ class TestKVPPConfig(TestBase):
     def test_kv_transfer_connectors(self):
         from copy import deepcopy
 
-        from vllm.config import KVTransferConfig
-
         from tests.ut.kvpp_utils import make_kvpp_config
+        from vllm.config import KVTransferConfig
 
         mooncake = {"kv_connector": "MooncakeConnectorV2", "kv_role": "kv_producer"}
         store = {"kv_connector": "AscendStoreConnector", "kv_role": "kv_both"}
@@ -2268,6 +2222,7 @@ class TestKVPPConfig(TestBase):
 
     def test_enable_switch_uses_tp_size(self):
         from tests.ut.kvpp_utils import make_kvpp_config
+
         from vllm_ascend.ascend_config import KVPPConfig
 
         for additional, tp, expected in (
@@ -2289,8 +2244,9 @@ class TestKVPPConfig(TestBase):
 
     def test_supported_configuration_and_restrictions(self):
         from tests.ut.kvpp_utils import make_kvpp_config
-        from vllm_ascend.ascend_config import KVPPConfig
         from vllm_ascend.platform import _validate_parallel_config
+
+        from vllm_ascend.ascend_config import KVPPConfig
 
         config = make_kvpp_config()
         KVPPConfig.from_vllm_config(config).validate(config)

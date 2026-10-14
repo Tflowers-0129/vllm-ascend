@@ -14,13 +14,12 @@ from vllm.v1.core.kv_cache_utils import BlockHashList, KVCacheBlock
 from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
 from vllm.v1.kv_cache_interface import KVCacheSpec
 from vllm.v1.request import Request
-
 from vllm_ascend.core.kv_cache_interface import (
     AscendIndexerKPoolTailSpec,
     AscendMLAAttentionSpec,
 )
+
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
-from vllm_ascend.utils import enable_dsa_cp
 
 
 def is_glm5_next_cache_spec(spec: KVCacheSpec) -> bool:
@@ -98,8 +97,6 @@ class Glm5NextIndexerCache(nn.Module, AttentionLayerBase):
         if dtype == torch.float8_e4m3fn:
             if not get_current_hardware_profile().supports(HardwareCapability.POOL_KEY_INDEXER_FP8):
                 raise NotImplementedError("GLM KPool FP8 LI requires CANN PoolKeyIndexer FP8 support on Ascend A5.")
-            if enable_dsa_cp():
-                raise NotImplementedError("GLM KPool FP8 LI does not support DSA context parallelism.")
         self.cache_role = cache_role
         self.cache_config = cache_config
         self.compress_ratio = compress_ratio

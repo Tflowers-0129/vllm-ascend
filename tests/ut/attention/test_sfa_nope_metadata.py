@@ -9,10 +9,10 @@ from unittest.mock import patch
 import pytest
 import torch
 from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadataBuilder
+from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFADSACPMetadataBuilder
 
 import vllm_ascend.attention.sfa_v1 as sfa
 import vllm_ascend.attention.sfa_v1 as sparse_mla
-from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFADSACPMetadataBuilder
 from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily
 
 
@@ -231,6 +231,14 @@ def test_mtp_nope_plan_uses_changing_device_active_count_at_fixed_capacity(monke
         common.query_start_loc.copy_(torch.arange(3).clamp(max=actual))
         metadata = builder.build_for_drafting(common, 1)
         assert metadata.num_actual_tokens_tensor is common.num_actual_tokens_tensor
+        monkeypatch.setattr(sfa, "sparse_flash_mla", lambda q, **kwargs: (q,))
+        sfa.sparse_mla(
+            torch.ones(2, 4, 8),
+            torch.zeros(8, 128, 1, 8),
+            torch.zeros(2, 1, 7, dtype=torch.int32),
+            metadata,
+            0.5,
+        )
         assert metadata.smla_topk_length[:, 0].tolist() == [7 if row < actual else 0 for row in range(2)]
         addresses.append((metadata.smla_topk_length.data_ptr(), metadata.smla_metadata.data_ptr()))
     assert len(set(addresses)) == 1

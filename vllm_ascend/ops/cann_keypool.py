@@ -6,17 +6,25 @@ from dataclasses import dataclass
 
 import torch
 import torch_npu
-
 from vllm_ascend.ops.triton.prepare_nonempty_keypool_inputs import prepare_nonempty_keypool_inputs
 
 
-def build_keypool_metadata(common, buffers, tokens, source, logical, ratio):
+def build_keypool_metadata(common, buffers, tokens, source, logical, ratio, *, query_metadata=None, local_start=0):
     if common.positions.device.type == "npu":
         from vllm_ascend.ops.triton.glm5_next_cann_keypool import (  # type: ignore[import-untyped]
             build_keypool_metadata as fused_metadata,
         )
 
-        return fused_metadata(common, buffers, tokens, source, logical, ratio)
+        return fused_metadata(
+            common,
+            buffers,
+            tokens,
+            source,
+            logical,
+            ratio,
+            query_metadata=query_metadata,
+            local_start=local_start,
+        )
     n = common.num_reqs
     positions, slots = buffers.positions[:tokens], buffers.slot_mapping[:tokens]
     seq, raw = buffers.seq_lens[:n], buffers.raw_seq_lens[:n]
@@ -48,6 +56,14 @@ def build_keypool_metadata(common, buffers, tokens, source, logical, ratio):
     compact.fill_(-1)
     if tokens:
         compact.scatter_(0, torch.where(completed, pooled + 1, 0), slots)
+    if query_metadata is not None:
+        local_end = local_start + query_metadata.positions.numel()
+        end = torch.minimum(query[1:], torch.as_tensor(local_end, device=query.device))
+        has_query = end > query[:-1].clamp_min(local_start)
+        local_lengths = torch.where(has_query, (raw - (query[1:] - local_end).clamp_min(0)).clamp_min(0), 0)
+        query_metadata.cum_query_lens.copy_((end - local_start).clamp_min(0))
+        query_metadata.seq_lens.copy_(local_lengths // ratio)
+        query_metadata.pool_tail.copy_(local_lengths % ratio)
     return positions, slots, seq, raw, query, ends, starts, tails
 
 
@@ -73,25 +89,34 @@ def build_tail_inputs(common, pool, capacity, page_rows, retained_width, buffers
     lengths = query.diff()
     starts = common.seq_lens[:n] - lengths
     pages = common.block_table_tensor[:n, 0]
-    columns = buffers["columns"]
+    columns = torch.arange(max(pool, capacity, retained_width), device=common.seq_lens.device)
     history = buffers["history"][:n]
     history.copy_(
         pages.clamp_min(0)[:, None] * page_rows + ((starts - starts % pool)[:, None] + columns[:pool]) % capacity
     )
     width = retained_width if retained_width else pool
-    writes, state = buffers["writes"][:n, :width], buffers["state"][:n, :width]
+    writes = buffers["writes"].view(-1)[: n * width].view(n, width)
+    state = buffers["state"].view(-1)[: n * width].view(n, width)
     retained = None
     if retained_width:
         raw = query[1:, None] - width + columns[:width]
         # Shape the prefix as contiguous rows to avoid per-layer flatten copies.
         retained = buffers["retained"].view(-1)[: n * width].view(n, width)
         retained.copy_(raw.clamp_min(0))
-        slots = torch.index_select(common.slot_mapping, 0, retained.flatten()).view(n, width)
-        writes.copy_(slots // capacity * page_rows + slots % capacity)
-        writes.masked_fill_(raw < query[:-1, None], -1)
+        if common.num_actual_tokens:
+            safe = retained.clamp_max(common.num_actual_tokens - 1)
+            slots = torch.index_select(common.slot_mapping, 0, safe.flatten()).view(n, width)
+            positions = torch.index_select(common.positions, 0, safe.flatten()).view(n, width)
+            writes.copy_(pages[:, None] * page_rows + positions % capacity)
+            writes.masked_fill_(
+                (raw < query[:-1, None]) | (raw >= common.num_actual_tokens) | (slots < 0) | (pages[:, None] < 0), -1
+            )
+        else:
+            writes.fill_(-1)
     else:
         end = starts % pool + lengths
-        state.copy_((buffers["requests"][:n] + 1 + (end >= pool) * n)[:, None] * pool + columns[:pool])
+        requests = torch.arange(n, device=common.seq_lens.device)
+        state.copy_((requests + 1 + (end >= pool) * n)[:, None] * pool + columns[:pool])
         positions = (starts + lengths - end % pool)[:, None] + columns[:pool]
         writes.copy_(pages[:, None] * page_rows + positions % capacity)
         writes.masked_fill_(
@@ -176,4 +201,3 @@ def pool_key_indexer_nonempty(
         mask_mode=mask_mode,
     )
     return indices[:tokens], values
-
