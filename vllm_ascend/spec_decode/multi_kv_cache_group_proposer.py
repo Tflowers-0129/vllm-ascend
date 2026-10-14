@@ -294,8 +294,9 @@ class AscendMultiKVCacheGroupMTPProposer(AscendEagleProposer):
             num_actual_tokens = common_attn_metadata.num_actual_tokens
             block_table_tensor = block_table.get_device_tensor()[:num_reqs]
             if not block_table.is_circular_group:
+                source_num_reqs = min(num_reqs, block_table_tensor.shape[0])
                 block_table.compute_slot_mapping(
-                    num_reqs,
+                    source_num_reqs,
                     common_attn_metadata.query_start_loc,
                     common_attn_metadata.positions[:num_actual_tokens],
                 )
