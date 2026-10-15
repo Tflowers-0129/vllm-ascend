@@ -33,6 +33,7 @@ from vllm_ascend.models.glm5next.kv_cache import (
     format_indexer_kpool_slot_mapping,
     get_kpool_tail_ring_capacity,
 )
+from vllm_ascend.utils import enable_dsa_cp
 from vllm_ascend.spec_decode.multi_kv_cache_group_proposer import AscendMultiKVCacheGroupMTPProposer
 
 pytestmark = pytest.mark.usefixtures("keypool_kernels")
@@ -58,6 +59,13 @@ def keypool_kernels(monkeypatch):
 @pytest.fixture(autouse=True)
 def default_dsa_cp_disabled(monkeypatch):
     monkeypatch.setattr("vllm_ascend.attention.indexer_kpool.enable_dsa_cp", lambda: False)
+
+
+@pytest.fixture
+def reset_dsa_cp_config_cache():
+    enable_dsa_cp.cache_clear()
+    yield
+    enable_dsa_cp.cache_clear()
 
 
 def _ratio_kwargs(ratio: int) -> dict[str, int]:
@@ -257,7 +265,8 @@ def test_indexer_metadata_addresses_complete_storage_pages(storage_block_size):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.int8, torch.float8_e4m3fn])
-def test_model_cache_layers_publish_source_compatible_specs(dtype):
+@pytest.mark.parametrize("dsa_cp", [False, True])
+def test_model_cache_layers_publish_source_compatible_specs(dtype, dsa_cp, reset_dsa_cp_config_cache):
     current_config = SimpleNamespace(
         parallel_config=SimpleNamespace(pipeline_parallel_size=2),
         compilation_config=SimpleNamespace(static_forward_context={}),
