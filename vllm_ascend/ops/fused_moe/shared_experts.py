@@ -130,6 +130,7 @@ class AscendSharedExperts:
         ascend_config = get_ascend_config()
         self.multistream_overlap = ascend_config.multistream_overlap_shared_expert
         self.weights_replicated = ascend_config.enable_shared_expert_dp
+        self._pending_weight_validation = False
 
         if self.multistream_overlap:
             # Wrap the quant_method's process_weights_after_loading to validate that
@@ -141,13 +142,28 @@ class AscendSharedExperts:
             @wraps(original_process_weights)
             def wrapped_process_weights(*args, **kwargs):
                 result = original_process_weights(*args, **kwargs)
-                self.validate_consistency()
+                # Prefetch restores selected weights to CPU after quantization.
+                # Validate on the first real/dummy forward, after the enclosing
+                # decoder layer has waited for its static-buffer prefetch.
+                if any(parameter.device.type == "cpu" for parameter in self.layer.parameters()):
+                    self._pending_weight_validation = True
+                else:
+                    self.validate_consistency()
+                    self._pending_weight_validation = False
                 return result
 
             quant_method.process_weights_after_loading = wrapped_process_weights  # type: ignore
 
     def set_lora_context(self, lora_context) -> None:
         self.lora_context = lora_context
+
+    def _validate_prefetched_weights(self) -> None:
+        if not self._pending_weight_validation:
+            return
+        if any(parameter.device.type == "cpu" for parameter in self.layer.parameters()):
+            raise RuntimeError("Shared expert validation requires prefetched device weights before forward")
+        self.validate_consistency()
+        self._pending_weight_validation = False
 
     def validate_consistency(self):
         """Validate that split shared expert computation matches integrated computation."""
@@ -738,6 +754,7 @@ class AscendSharedExperts:
         defer_output_wait: bool = False,
         submitted_gate_up: SubmittedSharedExpertGateUp | None = None,
     ) -> torch.Tensor:
+        self._validate_prefetched_weights()
         mode = self.parallel_mode()
         if submitted_gate_up is None:
             with npu_stream_switch(shared_experts_calculation_stream(), enabled=self.multistream_overlap):
