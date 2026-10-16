@@ -537,6 +537,8 @@ def test_backend_selects_cache_compatible_operator(monkeypatch, dsa_cp, cache_dt
         init_cann.assert_called_once()
     else:
         assert backend.indexer_op is (triton_op if cache_dtype == torch.int8 else cann_op).return_value
+        selected = triton_op if cache_dtype == torch.int8 else cann_op
+        selected.assert_called_once_with(4, 2)
         init_cann.assert_not_called()
     assert backend.num_cache_tensors == (2 if cache_dtype == torch.float8_e4m3fn else 1)
     assert backend.enable_sparse_li_c8 == (cache_dtype != torch.bfloat16)
