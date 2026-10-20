@@ -173,7 +173,6 @@ from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoader
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
 from vllm_ascend.eplb.eplb_updator import EplbUpdator
-from vllm_ascend.model_executor.offloader import create_offloader
 from vllm_ascend.models.deepseek_v41.cache_config import (
     is_deepseek_v41_cache,
 )
@@ -251,6 +250,7 @@ from vllm_ascend.worker.v2.kvpp import KVPPRuntime
 # yapf: enable
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
+from vllm_ascend.model_executor.offloader import create_offloader
 from vllm_ascend.models.glm5next.cache_views import view_glm5_next_cache
 from vllm_ascend.models.glm5next.kv_cache import is_glm5_next_cache_spec
 from vllm_ascend.spec_decode import get_spec_decode_method

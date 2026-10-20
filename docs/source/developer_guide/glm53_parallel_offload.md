@@ -21,7 +21,7 @@ cards, CANN 9.2, vLLM 0.30.0, GLM-5.3-Flash-W8A8-MXFP8-0918:
 --offload-backend prefetch --offload-group-size 4 --offload-num-in-group 1 \
 --offload-prefetch-step 1 --offload-params mlp --enforce-eager \
 --kv-cache-dtype fp8 --attention_config.indexer_kv_dtype fp8 \
---additional-config '{"multistream_overlap_shared_expert":true,"enable_fused_mc2":0,"enable_flashcomm1":false,"enable_dsa_cp":false,"c8_enable_reshape_optim":false}'
+--additional-config '{"multistream_overlap_shared_expert":true,"enable_fused_mc2":0,"enable_flashcomm1":false,"enable_dsa_cp":false}'
 ```
 
 Keep the existing model, MTP5, network and Mooncake producer arguments. The raw

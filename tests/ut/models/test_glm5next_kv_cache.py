@@ -18,6 +18,7 @@ from vllm_ascend.core.kv_cache_interface import (
     is_prefix_cacheable,
     register_ascend_kv_cache_specs,
 )
+from vllm_ascend.utils import enable_dsa_cp
 
 import vllm_ascend.attention.indexer_kpool as backend_module
 from vllm_ascend.attention.indexer_kpool import (
@@ -33,7 +34,6 @@ from vllm_ascend.models.glm5next.kv_cache import (
     format_indexer_kpool_slot_mapping,
     get_kpool_tail_ring_capacity,
 )
-from vllm_ascend.utils import enable_dsa_cp
 from vllm_ascend.spec_decode.multi_kv_cache_group_proposer import AscendMultiKVCacheGroupMTPProposer
 
 pytestmark = pytest.mark.usefixtures("keypool_kernels")

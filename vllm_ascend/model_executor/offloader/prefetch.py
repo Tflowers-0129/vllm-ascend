@@ -20,7 +20,6 @@ from vllm.model_executor.offloader.prefetch import (
 from vllm.model_executor.offloader.prefetch import (
     _ModuleOffloader as VllmModuleOffloader,
 )
-
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, bootstrap_custom_op_env
 
 # FRACTAL_NZ variants with an explicit C0 size, used by newer SoCs.

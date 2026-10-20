@@ -14,14 +14,8 @@ from torch import nn
 from torch.nn import functional as F
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.activation import SituAndMul
-
 from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.device.hardware import AscendDeviceType
-from vllm_ascend.device.hardware_profile import HardwareCapability, get_hardware_profile
-from vllm_ascend.ops import register_custom_ops as custom_ops
-from vllm_ascend.ops.fused_moe import fused_moe as fused_moe_module
-from vllm_ascend.ops.fused_moe import routed_experts as routed_experts_module
-from vllm_ascend.ops.fused_moe import shared_experts as shared_experts_module
 from vllm_ascend.ops.fused_moe.dataclass.shared_experts import (
     PreparedSharedExpertInput,
     RoutedMoEMilestones,
@@ -41,6 +35,15 @@ from vllm_ascend.ops.fused_moe.router.fused_topk_router import (
     AscendFusedTopKRouter,
 )
 from vllm_ascend.ops.fused_moe.router.grouped_topk_router import AscendGroupedTopKRouter
+from vllm_ascend.quantization.methods.base import PreparedLinearInput
+from vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8 import AscendW8A8MXFP8DynamicLinearMethod
+from vllm_ascend.quantization.quant_type import QuantType
+
+from vllm_ascend.device.hardware_profile import HardwareCapability, get_hardware_profile
+from vllm_ascend.ops import register_custom_ops as custom_ops
+from vllm_ascend.ops.fused_moe import fused_moe as fused_moe_module
+from vllm_ascend.ops.fused_moe import routed_experts as routed_experts_module
+from vllm_ascend.ops.fused_moe import shared_experts as shared_experts_module
 from vllm_ascend.ops.fused_moe.shared_experts import (
     AscendSharedExperts,
     PreparedSharedExpertExecution,
@@ -48,9 +51,6 @@ from vllm_ascend.ops.fused_moe.shared_experts import (
     SharedExpertParallelMode,
     SubmittedSharedExpertGateUp,
 )
-from vllm_ascend.quantization.methods.base import PreparedLinearInput
-from vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8 import AscendW8A8MXFP8DynamicLinearMethod
-from vllm_ascend.quantization.quant_type import QuantType
 
 
 def test_prepared_linear_input_import_does_not_cycle_through_moe():

@@ -3,10 +3,10 @@
 """GLM bounded-gate contracts for the AscendC KDA operators."""
 
 import torch
-
 from vllm_ascend.models.glm5next.ops.state_ops import gather_initial_states, scatter_states
-from vllm_ascend.ops.kda import run_chunk_kda, run_recurrent_kda
 from vllm_ascend.ops.triton.kda.output_writeback import write_recurrent_output
+
+from vllm_ascend.ops.kda import run_chunk_kda, run_recurrent_kda
 
 KDA_MAX_RECURRENT_TOKENS = 8
 KDA_FUSED_QK_HEAD_DIM = 128

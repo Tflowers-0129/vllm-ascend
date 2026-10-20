@@ -7,7 +7,6 @@ not generated-text quality. Both sides share the same quantized K/V cache.
 """
 
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import cann_ops_transformer  # noqa: F401
 import pytest
@@ -80,8 +79,18 @@ def check(lengths, history, pool=4, topk=2048, padded=0):
     builder._max_num_metadata_reqs = len(lengths)
     builder._dsa_cp_query_buffers = {}
     builder.device = torch.device("npu")
+    builder.logical_block_size = 128
+    builder.kernel_row_block_size = page
+    builder._max_num_batched_tokens = size
+    builder._metadata_buffers = {}
+    builder._captured_state_tables = {}
+    builder._state_table_scratch = {}
+    builder._state_table_shapes = {}
     common = SimpleNamespace(
         slot_mapping=torch.zeros(size, device="npu", dtype=torch.int64),
+        positions=positions,
+        num_input_tokens=size,
+        block_table_tensor=table,
         num_reqs=len(lengths),
         num_actual_tokens=total,
         query_start_loc=starts.to(torch.int32),
@@ -90,8 +99,8 @@ def check(lengths, history, pool=4, topk=2048, padded=0):
     shards = []
     for rank in range(2):
         lo, hi = rank * (size // 2), (rank + 1) * (size // 2)
-        with patch.object(metadata_module, "get_tp_group", return_value=SimpleNamespace(rank_in_group=rank)):
-            meta = builder._build_query_metadata(common, positions)
+        builder.dsa_cp_rank = rank
+        meta = builder.build(0, common).query_metadata
         actual = max(min(hi, total) - lo, 0)
         output = run(q[lo:hi], weights[lo:hi], positions[lo:hi], meta.cum_query_lens, meta.seq_lens, meta.pool_tail)
         output[actual:] = -1

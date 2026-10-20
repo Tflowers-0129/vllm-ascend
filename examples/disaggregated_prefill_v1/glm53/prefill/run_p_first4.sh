@@ -61,6 +61,6 @@ exec vllm serve "$MODEL_PATH" \
   --limit-mm-per-prompt '{"image":1,"video":0}' \
   --gpu-memory-utilization 0.9 \
   --speculative-config '{"num_speculative_tokens":5,"method":"deepseek_mtp","enforce_eager":true}' \
-  --additional-config '{"multistream_overlap_shared_expert":true,"enable_fused_mc2":0,"enable_flashcomm1":true,"enable_dsa_cp":true,"c8_enable_reshape_optim":false}' \
+  --additional-config '{"multistream_overlap_shared_expert":true,"enable_fused_mc2":0,"enable_flashcomm1":true,"enable_dsa_cp":true}' \
   --kv-transfer-config "{\"kv_connector\":\"MooncakeConnectorV1\",\"kv_role\":\"kv_producer\",\"kv_port\":\"${P_KV_PORT}\",\"engine_id\":\"${P_ENGINE_ID}\",\"kv_connector_extra_config\":{\"prefill\":{\"dp_size\":1,\"tp_size\":2,\"pp_size\":2},\"decode\":{\"dp_size\":8,\"tp_size\":1},\"ascend_local_comm_res_path\":\"/etc/hixlep\"}}" \
   --profiler-config '{"profiler": "torch", "torch_profiler_dir": "/mnt/share/z00909726/glm53/profiling/2p1d", "torch_profiler_with_stack": false, "torch_profiler_record_shapes": false}'

@@ -24,8 +24,7 @@ MLP-only prefetch with group size 4, one offloaded layer per group and step 1:
   "multistream_overlap_shared_expert": true,
   "enable_fused_mc2": 0,
   "enable_flashcomm1": true,
-  "enable_dsa_cp": true,
-  "c8_enable_reshape_optim": false
+  "enable_dsa_cp": true
 }
 ```
 

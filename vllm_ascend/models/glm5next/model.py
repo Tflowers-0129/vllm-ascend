@@ -75,7 +75,6 @@ from vllm.models.common.ops.sequence_parallel import (
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
-
 from vllm_ascend.utils import vllm_version_is
 
 # vLLM #57387 moved the GLM-5-Next config classes into the `transformers`
