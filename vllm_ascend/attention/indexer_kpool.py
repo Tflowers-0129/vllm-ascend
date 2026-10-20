@@ -141,7 +141,6 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
         # Keep captured storage isolated between MTP draft steps.
         self._metadata_buffers: dict[int, _KPoolMetadataBuffers] = {}
         self._dsa_cp_query_buffers: dict[int, torch.Tensor] = {}
-        self._dsa_cp_key_buffers: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self._captured_state_tables: dict[tuple[int, int, int], torch.Tensor] = {}
         self._state_table_scratch: dict[int, torch.Tensor] = {}
         self._state_table_shapes: dict[int, tuple[int, int]] = {}
@@ -157,9 +156,9 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
         key = common.slot_mapping.data_ptr()
         if key not in self._dsa_cp_query_buffers:
             self._dsa_cp_query_buffers[key] = torch.empty(
-                self._max_num_metadata_reqs, dtype=torch.int32, device=self.device
+                (3, self._max_num_metadata_reqs), dtype=torch.int64, device=self.device
             )
-        query_lens = self._dsa_cp_query_buffers[key][: common.num_reqs]
+        query_lens, pool_lens, pool_tail = self._dsa_cp_query_buffers[key][:, : common.num_reqs]
         local_query_lens, local_key_lens = get_cp_local_query_key_lens(
             common.query_start_loc,
             common.query_start_loc[1 : common.num_reqs + 1],
@@ -168,21 +167,16 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
             local_end,
         )
         query_lens.copy_(local_query_lens)
-        if key not in self._dsa_cp_key_buffers:
-            self._dsa_cp_key_buffers[key] = tuple(
-                torch.empty(self._max_num_metadata_reqs, dtype=torch.int64, device=self.device) for _ in range(2)
-            )
-        key_lens, pool_tail = (buffer[: common.num_reqs] for buffer in self._dsa_cp_key_buffers[key])
         # CANN causal masking must end at this rank's last query, rather than
         # at the global request end. Empty local requests expose no keys.
-        key_lens.copy_(torch.div(local_key_lens, self.compress_ratio, rounding_mode="floor"))
-        pool_tail.copy_(torch.remainder(local_key_lens, self.compress_ratio))
+        torch.div(local_key_lens, self.compress_ratio, rounding_mode="floor", out=pool_lens)
+        torch.remainder(local_key_lens, self.compress_ratio, out=pool_tail)
         return AscendIndexerKPoolQueryMetadata(
             positions=positions[local_start:local_end],
             cum_query_lens=query_lens,
-            num_actual_tokens=max(min(local_end, common.num_actual_tokens) - local_start, 0),
-            seq_lens=key_lens,
+            seq_lens=pool_lens,
             pool_tail=pool_tail,
+            num_actual_tokens=max(min(local_end, common.num_actual_tokens) - local_start, 0),
         )
 
     def _get_metadata_buffers(self, common_attn_metadata: CommonAttentionMetadata) -> _KPoolMetadataBuffers:
@@ -578,7 +572,9 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
             logger.info_once(
                 "KPool indexer LI C8 enabled: dtype=%s, backend=%s, dsa_cp=%s",
                 self.k_cache.dtype,
-                "Triton" if self.k_cache.dtype == torch.int8 else "CANN",
+                "CANN CP"
+                if enable_dsa_cp() and self.k_cache.dtype == torch.float8_e4m3fn
+                else ("Triton" if enable_dsa_cp() or self.k_cache.dtype == torch.int8 else "CANN"),
                 enable_dsa_cp(),
             )
         for name in (
